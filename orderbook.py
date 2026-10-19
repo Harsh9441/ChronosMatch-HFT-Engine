@@ -1,8 +1,10 @@
-""" Order Book (Teammate 3)
-Day 1: skeleton only. Stores buy/sell orders in simple Python structures.
+
+"""ChronosMatch - Order Book
+Teammate 3: Day 1, Day 2, Day 3
 """
-from collections import deque
+
 from dataclasses import dataclass
+from typing import Optional
 
 BUY = "B"
 SELL = "S"
@@ -10,26 +12,49 @@ SELL = "S"
 
 @dataclass
 class Order:
-    order_id: int
-    side: str        # "B" = buy, "S" = sell
-    price: int       # in cents, e.g. 10050 = 100.50
-    qty: int
-    timestamp: int = 0
+    order_id: str
+    side: str
+    price: float
+    quantity: int
 
 
 class OrderBook:
     def __init__(self):
-        self.bids = {}    # buy orders:  price -> queue of orders
-        self.asks = {}    # sell orders: price -> queue of orders
-        self.orders = {}  # order_id -> Order (fast lookup)
-        self.count = 0    # total orders received
+        # Day 1: Basic order-book structure
+        self.buys: list[Order] = []
+        self.sells: list[Order] = []
 
-    def __repr__(self):
-        return (f"OrderBook(bid_levels={len(self.bids)}, "
-                f"ask_levels={len(self.asks)}, orders={self.count})")
+    def add_order(self, order: Order) -> None:
+        # Day 2: Insert buy or sell orders
+        if not order.order_id:
+            raise ValueError("Order ID cannot be empty")
+        if order.side not in (BUY, SELL):
+            raise ValueError("Side must be B or S")
+        if order.price <= 0 or order.quantity <= 0:
+            raise ValueError("Price and quantity must be positive")
 
+        book = self.buys if order.side == BUY else self.sells
 
-if __name__ == "__main__":
-    book = OrderBook()
-    print(book)
-    print("Sample order:", Order(1, BUY, 10050, 10))
+        if any(existing.order_id == order.order_id
+               for existing in self.get_all_orders()):
+            raise ValueError("Duplicate order ID")
+
+        book.append(order)
+
+    def get_orders(self, side: str) -> list[Order]:
+        # Day 3: Retrieve orders by side
+        if side == BUY:
+            return list(self.buys)
+        if side == SELL:
+            return list(self.sells)
+        raise ValueError("Side must be B or S")
+
+    def get_all_orders(self) -> list[Order]:
+        return self.get_orders(BUY) + self.get_orders(SELL)
+
+    def get_order(self, order_id: str) -> Optional[Order]:
+        # Retrieve a single order by ID
+        for order in self.get_all_orders():
+            if order.order_id == order_id:
+                return order
+        return None
