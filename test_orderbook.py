@@ -2,7 +2,7 @@
 
 import unittest
 
-from order_book import BUY, SELL, Order, OrderBook
+from orderbook import BUY, SELL, Order, OrderBook
 
 
 class TestOrderBook(unittest.TestCase):
@@ -95,6 +95,33 @@ class TestOrderBook(unittest.TestCase):
         self.book.add_order(buy)
         self.book.add_order(sell)
         self.assertEqual(self.book.snapshot(), {"buys": [buy], "sells": [sell]})
+
+    # Day 5: firehose integration
+    def test_ingest_firehose_events(self):
+        events = [
+            {"order_id": "B1", "side": BUY, "price": 100.0, "quantity": 5},
+            {"order_id": "S1", "side": SELL, "price": 101, "quantity": 3},
+        ]
+
+        self.assertEqual(self.book.ingest_firehose(events), 2)
+        self.assertEqual(self.book.get_order("B1"), Order("B1", BUY, 100.0, 5))
+        self.assertEqual(self.book.get_order("S1"), Order("S1", SELL, 101.0, 3))
+
+    def test_ingest_empty_firehose(self):
+        self.assertEqual(self.book.ingest_firehose([]), 0)
+        self.assertEqual(len(self.book), 0)
+
+    def test_ingest_firehose_rejects_missing_fields(self):
+        with self.assertRaisesRegex(ValueError, "missing field 'quantity'"):
+            self.book.ingest_firehose(
+                [{"order_id": "B1", "side": BUY, "price": 100.0}]
+            )
+
+    def test_ingest_firehose_reports_invalid_order(self):
+        with self.assertRaisesRegex(ValueError, "Firehose event 1"):
+            self.book.ingest_firehose(
+                [{"order_id": "B1", "side": BUY, "price": 100.0, "quantity": 0}]
+            )
 
 
 if __name__ == "__main__":
