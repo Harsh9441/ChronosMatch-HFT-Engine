@@ -1,5 +1,5 @@
 """ChronosMatch - Order Book (Teammate 3)
-Combined Day 1-6 reference implementation.
+Combined Day 1-7 reference implementation.
 
 Day 1: Basic order-book structure.
 Day 2: Insert buy/sell orders with validation.
@@ -7,18 +7,14 @@ Day 3: Retrieve orders and look up an order by ID.
 Day 4: Cancel orders and inspect best bid/ask prices.
 Day 5: Ingest firehose events into the order book.
 Day 6: Ingest from an async firehose; fast lookup by order ID.
+Day 7: Tests for order insertion (see test_day7_insertion.py).
 
 This is a storage/order-book module, not a full trade-matching engine.
 """
-# import math
+
 import math
-from dataclasses import dataclass
 from collections.abc import AsyncIterable, Iterable, Mapping
-from typing import Optional
-
-
 from dataclasses import dataclass
-from collections.abc import AsyncIterable, Iterable, Mapping
 from typing import Optional
 
 BUY = "B"
@@ -40,8 +36,6 @@ class OrderBook:
         self.sells: list[Order] = []
         # Day 6: order_id -> Order, so lookups and duplicate checks are instant.
         self._by_id: dict[str, Order] = {}
-        # if order.price <= 0:
-        
 
     def add_order(self, order: Order) -> None:
         """Day 2: Validate and insert a buy or sell order."""
@@ -51,6 +45,8 @@ class OrderBook:
             raise ValueError("Side must be 'B' (buy) or 'S' (sell)")
         if isinstance(order.price, bool) or not isinstance(order.price, (int, float)):
             raise ValueError("Price must be a number")
+        if not math.isfinite(order.price):
+            raise ValueError("Price must be finite")
         if order.price <= 0:
             raise ValueError("Price must be positive")
         if isinstance(order.quantity, bool) or not isinstance(order.quantity, int):
@@ -64,10 +60,13 @@ class OrderBook:
         book.append(order)
         self._by_id[order.order_id] = order
 
-    def ingest_firehose(
-        self, events: Iterable[Mapping[str, object]]
-    ) -> int:
-        """Add firehose events with order_id, side, price, and quantity fields."""
+    def ingest_firehose(self, events: Iterable[Mapping[str, object]]) -> int:
+        """Add firehose events with order_id, side, price, and quantity fields.
+
+        Events are inserted one at a time. If an event is bad, a ValueError
+        (or TypeError for a non-mapping event) is raised and the events
+        before it stay in the book.
+        """
         ingested = 0
         for event_number, event in enumerate(events, start=1):
             if not isinstance(event, Mapping):
@@ -155,4 +154,3 @@ class OrderBook:
 
     def __len__(self) -> int:
         return len(self.buys) + len(self.sells)
-    
