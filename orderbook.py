@@ -10,6 +10,12 @@ Day 6: Ingest from an async firehose; fast lookup by order ID.
 
 This is a storage/order-book module, not a full trade-matching engine.
 """
+# import math
+import math
+from dataclasses import dataclass
+from collections.abc import AsyncIterable, Iterable, Mapping
+from typing import Optional
+
 
 from dataclasses import dataclass
 from collections.abc import AsyncIterable, Iterable, Mapping
@@ -34,6 +40,8 @@ class OrderBook:
         self.sells: list[Order] = []
         # Day 6: order_id -> Order, so lookups and duplicate checks are instant.
         self._by_id: dict[str, Order] = {}
+        # if order.price <= 0:
+        
 
     def add_order(self, order: Order) -> None:
         """Day 2: Validate and insert a buy or sell order."""
@@ -147,3 +155,4 @@ class OrderBook:
 
     def __len__(self) -> int:
         return len(self.buys) + len(self.sells)
+    
