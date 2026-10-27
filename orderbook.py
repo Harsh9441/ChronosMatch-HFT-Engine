@@ -1,5 +1,5 @@
 """ChronosMatch - Order Book (Teammate 3)
-Combined Day 1-7 reference implementation.
+Combined Day 1-8 reference implementation.
 
 Day 1: Basic order-book structure.
 Day 2: Insert buy/sell orders with validation.
@@ -8,8 +8,10 @@ Day 4: Cancel orders and inspect best bid/ask prices.
 Day 5: Ingest firehose events into the order book.
 Day 6: Ingest from an async firehose; fast lookup by order ID.
 Day 7: Tests for order insertion (see test_day7_insertion.py).
+Day 8: Validate matched trades against the order book.
 
 This is a storage/order-book module, not a full trade-matching engine.
+Trade validation only CHECKS trades; it never changes the book.
 """
 
 import math
@@ -154,3 +156,122 @@ class OrderBook:
 
     def __len__(self) -> int:
         return len(self.buys) + len(self.sells)
+
+
+# ---------------------------------------------------------------
+# Day 8: Trade validation
+# ---------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Trade:
+    trade_id: str
+    buy_order_id: str
+    sell_order_id: str
+    price: float
+    quantity: int
+
+
+def check_trades(book: OrderBook, trades: Iterable[Trade]) -> list[str]:
+    """Return a list of problems found. An empty list means all trades are valid.
+
+    Rules checked for every trade:
+      - trade_id is a non-empty string and unique within the batch
+      - price is a finite, positive number; quantity is a positive integer
+      - both order IDs exist in the book, the buy ID is a buy order and the
+        sell ID is a sell order
+      - the orders cross: buy limit price >= sell limit price
+      - the trade price lies between the sell and buy limit prices
+      - total quantity traded per order, across the batch, never exceeds the
+        order's quantity (no overfills)
+
+    Trades with a problem do not count toward the overfill totals.
+    """
+    problems: list[str] = []
+    seen_ids: set[str] = set()
+    filled: dict[str, int] = {}
+
+    for n, trade in enumerate(trades, start=1):
+        errors: list[str] = []
+
+        # --- trade id ---
+        if not isinstance(trade.trade_id, str) or not trade.trade_id.strip():
+            errors.append("trade ID cannot be empty")
+        elif trade.trade_id in seen_ids:
+            errors.append(f"duplicate trade ID {trade.trade_id!r}")
+        if isinstance(trade.trade_id, str):
+            seen_ids.add(trade.trade_id)
+
+        # --- price and quantity ---
+        price_ok = (
+            not isinstance(trade.price, bool)
+            and isinstance(trade.price, (int, float))
+            and math.isfinite(trade.price)
+            and trade.price > 0
+        )
+        if not price_ok:
+            errors.append("price must be a finite positive number")
+
+        qty_ok = (
+            not isinstance(trade.quantity, bool)
+            and isinstance(trade.quantity, int)
+            and trade.quantity > 0
+        )
+        if not qty_ok:
+            errors.append("quantity must be a positive integer")
+
+        # --- orders ---
+        buy = book.get_order(trade.buy_order_id) if isinstance(trade.buy_order_id, str) else None
+        sell = book.get_order(trade.sell_order_id) if isinstance(trade.sell_order_id, str) else None
+
+        if buy is None:
+            errors.append(f"buy order {trade.buy_order_id!r} not found")
+        elif buy.side != BUY:
+            errors.append(f"order {buy.order_id!r} is not a buy order")
+            buy = None
+
+        if sell is None:
+            errors.append(f"sell order {trade.sell_order_id!r} not found")
+        elif sell.side != SELL:
+            errors.append(f"order {sell.order_id!r} is not a sell order")
+            sell = None
+
+        # --- price relationships ---
+        if buy is not None and sell is not None:
+            if buy.price < sell.price:
+                errors.append(
+                    f"orders do not cross (buy {buy.price} < sell {sell.price})"
+                )
+            elif price_ok and not (sell.price <= trade.price <= buy.price):
+                errors.append(
+                    f"trade price {trade.price} outside "
+                    f"[{sell.price}, {buy.price}]"
+                )
+
+        # --- overfill ---
+        if qty_ok:
+            for order in (buy, sell):
+                if order is None:
+                    continue
+                total = filled.get(order.order_id, 0) + trade.quantity
+                if total > order.quantity:
+                    errors.append(
+                        f"order {order.order_id!r} overfilled "
+                        f"({total} > {order.quantity})"
+                    )
+
+        if errors:
+            problems.extend(f"Trade {n}: {e}" for e in errors)
+        else:
+            filled[buy.order_id] = filled.get(buy.order_id, 0) + trade.quantity
+            filled[sell.order_id] = filled.get(sell.order_id, 0) + trade.quantity
+
+    return problems
+
+
+def validate_trades(book: OrderBook, trades: Iterable[Trade]) -> int:
+    """Raise ValueError listing every problem, or return the number of valid trades."""
+    trades = list(trades)
+    problems = check_trades(book, trades)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return len(trades)
