@@ -1,5 +1,5 @@
 """ChronosMatch - Order Book (Teammate 3)
-Combined Day 1-8 reference implementation.
+Combined Day 1-9 reference implementation.
 
 Day 1: Basic order-book structure.
 Day 2: Insert buy/sell orders with validation.
@@ -9,14 +9,18 @@ Day 5: Ingest firehose events into the order book.
 Day 6: Ingest from an async firehose; fast lookup by order ID.
 Day 7: Tests for order insertion (see test_day7_insertion.py).
 Day 8: Validate matched trades against the order book.
+Day 9: Stress tests with 10K+ orders (see test_day9_stress.py).
+       Cancel is O(1); best bid/ask use heaps, so big books stay fast.
 
 This is a storage/order-book module, not a full trade-matching engine.
 Trade validation only CHECKS trades; it never changes the book.
 """
 
+import heapq
 import math
 from collections.abc import AsyncIterable, Iterable, Mapping
 from dataclasses import dataclass
+from itertools import count
 from typing import Optional
 
 BUY = "B"
@@ -33,11 +37,28 @@ class Order:
 
 class OrderBook:
     def __init__(self) -> None:
-        # Day 1: Store buy and sell orders separately.
-        self.buys: list[Order] = []
-        self.sells: list[Order] = []
+        # Day 1: Store buy and sell orders separately. Dicts keep arrival
+        # order and make cancelling O(1) (Day 9).
+        self._buys: dict[str, Order] = {}
+        self._sells: dict[str, Order] = {}
         # Day 6: order_id -> Order, so lookups and duplicate checks are instant.
         self._by_id: dict[str, Order] = {}
+        # Day 9: heaps for best bid/ask. Entries are (sort price, seq, order);
+        # cancelled orders are dropped lazily when they reach the top.
+        self._bid_heap: list[tuple[float, int, Order]] = []
+        self._ask_heap: list[tuple[float, int, Order]] = []
+        self._seq_by_id: dict[str, int] = {}
+        self._next_seq = count()
+
+    @property
+    def buys(self) -> list[Order]:
+        """Buy orders in arrival order (a copy)."""
+        return list(self._buys.values())
+
+    @property
+    def sells(self) -> list[Order]:
+        """Sell orders in arrival order (a copy)."""
+        return list(self._sells.values())
 
     def add_order(self, order: Order) -> None:
         """Day 2: Validate and insert a buy or sell order."""
@@ -58,9 +79,15 @@ class OrderBook:
         if order.order_id in self._by_id:
             raise ValueError(f"Duplicate order ID: {order.order_id}")
 
-        book = self.buys if order.side == BUY else self.sells
-        book.append(order)
+        seq = next(self._next_seq)
+        if order.side == BUY:
+            self._buys[order.order_id] = order
+            heapq.heappush(self._bid_heap, (-order.price, seq, order))
+        else:
+            self._sells[order.order_id] = order
+            heapq.heappush(self._ask_heap, (order.price, seq, order))
         self._by_id[order.order_id] = order
+        self._seq_by_id[order.order_id] = seq
 
     def ingest_firehose(self, events: Iterable[Mapping[str, object]]) -> int:
         """Add firehose events with order_id, side, price, and quantity fields.
@@ -120,9 +147,9 @@ class OrderBook:
     def get_orders(self, side: str) -> list[Order]:
         """Day 3: Return a copy of orders for the requested side."""
         if side == BUY:
-            return list(self.buys)
+            return list(self._buys.values())
         if side == SELL:
-            return list(self.sells)
+            return list(self._sells.values())
         raise ValueError("Side must be 'B' (buy) or 'S' (sell)")
 
     def get_all_orders(self) -> list[Order]:
@@ -138,24 +165,56 @@ class OrderBook:
         order = self._by_id.pop(order_id, None)
         if order is None:
             return False
-        book = self.buys if order.side == BUY else self.sells
-        book.remove(order)
+        self._seq_by_id.pop(order_id, None)
+        if order.side == BUY:
+            del self._buys[order_id]
+            self._compact(self._bid_heap, self._buys, BUY)
+        else:
+            del self._sells[order_id]
+            self._compact(self._ask_heap, self._sells, SELL)
         return True
 
+    def _compact(self, heap, live: dict, side: str) -> None:
+        """Rebuild a heap when it holds far more dead entries than live orders."""
+        if len(heap) <= 2 * len(live) + 64:
+            return
+        heap.clear()
+        for order in live.values():                  # dict order = arrival order
+            seq = next(self._next_seq)
+            self._seq_by_id[order.order_id] = seq
+            key = -order.price if side == BUY else order.price
+            heap.append((key, seq, order))
+        heapq.heapify(heap)
+
+    def _top(self, heap) -> Optional[Order]:
+        """Return the best live order in a heap, discarding dead entries."""
+        while heap:
+            _, seq, order = heap[0]
+            if self._seq_by_id.get(order.order_id) == seq:
+                return order
+            heapq.heappop(heap)
+        return None
+
     def best_bid(self) -> Optional[Order]:
-        """Day 4: Return the highest-priced buy order, or None."""
-        return max(self.buys, key=lambda order: order.price, default=None)
+        """Day 4: Return the highest-priced buy order, or None.
+
+        Ties go to the order that arrived first.
+        """
+        return self._top(self._bid_heap)
 
     def best_ask(self) -> Optional[Order]:
-        """Day 4: Return the lowest-priced sell order, or None."""
-        return min(self.sells, key=lambda order: order.price, default=None)
+        """Day 4: Return the lowest-priced sell order, or None.
+
+        Ties go to the order that arrived first.
+        """
+        return self._top(self._ask_heap)
 
     def snapshot(self) -> dict[str, list[Order]]:
         """Return a simple snapshot for display/integration."""
         return {"buys": self.get_orders(BUY), "sells": self.get_orders(SELL)}
 
     def __len__(self) -> int:
-        return len(self.buys) + len(self.sells)
+        return len(self._buys) + len(self._sells)
 
 
 # ---------------------------------------------------------------
