@@ -1,5 +1,5 @@
 """ChronosMatch - Order Book (Teammate 3)
-Combined Day 1-9 reference implementation.
+Combined Day 1-10 reference implementation.
 
 Day 1: Basic order-book structure.
 Day 2: Insert buy/sell orders with validation.
@@ -11,6 +11,8 @@ Day 7: Tests for order insertion (see test_day7_insertion.py).
 Day 8: Validate matched trades against the order book.
 Day 9: Stress tests with 10K+ orders (see test_day9_stress.py).
        Cancel is O(1); best bid/ask use heaps, so big books stay fast.
+Day 10: get_orders_in_arrival_order() hands the whole book to a matching engine
+       in the exact order the orders arrived (see test_day10_integration.py).
 
 This is a storage/order-book module, not a full trade-matching engine.
 Trade validation only CHECKS trades; it never changes the book.
@@ -155,6 +157,14 @@ class OrderBook:
     def get_all_orders(self) -> list[Order]:
         """Return all buy orders followed by all sell orders."""
         return self.get_orders(BUY) + self.get_orders(SELL)
+
+    def get_orders_in_arrival_order(self) -> list[Order]:
+        """Day 10: Return every order, buys and sells mixed, oldest first.
+
+        A matching engine needs this order for price-time priority. (The
+        separate buy and sell dictionaries only know the order within a side.)
+        An id that is cancelled and then used again counts as a new arrival."""
+        return list(self._by_id.values())
 
     def get_order(self, order_id: str) -> Optional[Order]:
         """Return one order by ID, or None if it does not exist."""
