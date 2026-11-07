@@ -1,6 +1,6 @@
 """
 ChronosMatch - Order Book (Teammate 3)
-Combined Day 1-12 implementation.
+Combined Day 1-14 implementation.
 
 Day 1: Basic order-book structure.
 Day 2: Insert buy/sell orders with validation.
@@ -14,13 +14,18 @@ Day 9: Heap-based best bid/ask and stress-test support.
 Day 10: Retrieve orders in arrival order.
 Day 11: Binary IPC encoding and decoding.
 Day 12: Batch IPC transmission and ingestion.
+Day 13: Load test with 50,000+ orders.
+Day 14: Zero-copy architecture verification.
 
 This is a storage/order-book module, not a full matching engine.
 """
 
 import heapq
 import math
+import random
 import struct
+import time
+import tracemalloc
 
 from collections.abc import AsyncIterable, Iterable, Mapping
 from dataclasses import dataclass
@@ -162,10 +167,10 @@ class OrderBook:
         self._seq_by_id.pop(order_id, None)
 
         if order.side == BUY:
-            self._buys.pop(order_id, None)
+            del self._buys[order_id]
             self._compact(self._bid_heap, self._buys, BUY)
         else:
-            self._sells.pop(order_id, None)
+            del self._sells[order_id]
             self._compact(self._ask_heap, self._sells, SELL)
 
         return True
@@ -489,10 +494,10 @@ def validate_trades(
 # ============================================================
 
 # Wire format: a 4-byte event count, then each event as
-#   id length (2 bytes), side (1 byte, char code), price (8-byte float),
+#   side (1 byte), id length (2 bytes), price (8-byte float),
 #   quantity (8 bytes), then the id text.  All big-endian.
 _IPC_HEADER = struct.Struct("!I")      # event count
-_IPC_EVENT = struct.Struct("!HcdQ")    # id length, side, price, quantity
+_IPC_EVENT = struct.Struct("!cHdQ")    # side, id length, price, quantity
 
 
 def _check_fields(where, order_id, side, price, quantity):
@@ -565,8 +570,8 @@ def encode_events(events: Iterable) -> bytes:
         offset = len(payload)
         payload.extend(bytes(_IPC_EVENT.size + len(id_bytes)))
         _IPC_EVENT.pack_into(
-            payload, offset, len(id_bytes),
-            side.encode("ascii"), float(price), quantity
+            payload, offset,
+            side.encode("ascii"), len(id_bytes), float(price), quantity
         )
         start = offset + _IPC_EVENT.size
         payload[start:start + len(id_bytes)] = id_bytes
@@ -599,14 +604,14 @@ def decode_events(payload) -> list[dict]:
         where = f"IPC event {n}"
 
         if len(view) - offset < _IPC_EVENT.size:
-            raise ValueError("Unsupported IPC version")
+            raise ValueError(f"{where}: incomplete data")
 
-        id_length, side_bytes, price, quantity = (
+        side_bytes, id_length, price, quantity = (
             _IPC_EVENT.unpack_from(view, offset)
         )
         offset += _IPC_EVENT.size
 
-        if len(view) - offset < id_length:
+        if id_length == 0 or len(view) - offset < id_length:
             raise ValueError(f"{where}: invalid order ID length")
 
         try:
@@ -620,11 +625,13 @@ def decode_events(payload) -> list[dict]:
         code = side_bytes[0]
         side = chr(code)
 
-        if side not in (BUY, SELL):
-            raise ValueError(f"side code {code}")
-
         if not order_id.strip():
             raise ValueError(f"{where}: invalid order ID (cannot be empty)")
+
+        if side not in (BUY, SELL):
+            raise ValueError(
+                f"{where}: invalid side code {_side_label(code)}"
+            )
 
         if not math.isfinite(price):
             raise ValueError(f"{where}: invalid price (must be finite)")
@@ -665,3 +672,380 @@ def receive_events(connection) -> list[dict]:
 def ingest_encoded(book: OrderBook, payload) -> int:
     """Decode IPC data and insert it into an OrderBook."""
     return book.ingest_encoded(payload)
+
+
+# ============================================================
+# DAY 13: LOAD TEST (50,000+ ORDERS)
+# ============================================================
+
+def make_load_events(n_orders: int, seed: int = 13) -> list[dict]:
+    """Build a repeatable list of valid order events."""
+
+    rng = random.Random(seed)
+
+    return [
+        {
+            "order_id": f"L{i}",
+            "side": BUY if rng.random() < 0.5 else SELL,
+            "price": round(rng.uniform(90, 110), 2),
+            "quantity": rng.randint(1, 1000),
+        }
+        for i in range(n_orders)
+    ]
+
+
+def _best_prices_match(book: OrderBook) -> bool:
+    """Compare best_bid / best_ask with a brute-force scan."""
+
+    buys = book.get_orders(BUY)
+    sells = book.get_orders(SELL)
+    bid, ask = book.best_bid(), book.best_ask()
+
+    if buys:
+        bid_ok = bid is not None and bid.price == max(o.price for o in buys)
+    else:
+        bid_ok = bid is None
+
+    if sells:
+        ask_ok = ask is not None and ask.price == min(o.price for o in sells)
+    else:
+        ask_ok = ask is None
+
+    return bid_ok and ask_ok
+
+
+def run_load_test(
+    n_orders: int = 50_000,
+    cancel_fraction: float = 0.2,
+    seed: int = 13
+) -> dict:
+    """Push n_orders through encode, decode, ingest and cancel, and check
+    every result. Returns timings, rates and a dict of pass/fail checks."""
+
+    if n_orders < 1:
+        raise ValueError("n_orders must be at least 1")
+
+    if not 0 <= cancel_fraction < 1:
+        raise ValueError("cancel_fraction must be from 0 up to (not incl.) 1")
+
+    rng = random.Random(seed)
+    events = make_load_events(n_orders, seed)
+    ids = [e["order_id"] for e in events]
+
+    def timed(fn):
+        start = time.perf_counter()
+        value = fn()
+        return value, max(time.perf_counter() - start, 1e-9)
+
+    payload, encode_s = timed(lambda: encode_events(events))
+    decoded, decode_s = timed(lambda: decode_events(payload))
+
+    direct = OrderBook()
+    _, ingest_s = timed(lambda: direct.ingest_firehose(events))
+
+    book = OrderBook()
+    _, ingest_encoded_s = timed(lambda: book.ingest_encoded(payload))
+
+    checks: dict[str, bool] = {}
+    arrival = book.get_orders_in_arrival_order()
+
+    checks["decoded_equals_input"] = decoded == events
+    checks["encoded_path_matches_direct_path"] = (
+        arrival == direct.get_orders_in_arrival_order()
+    )
+    checks["all_orders_stored"] = len(book) == n_orders
+    checks["no_duplicate_ids"] = (
+        len({o.order_id for o in arrival}) == n_orders
+    )
+    checks["arrival_order_kept"] = [o.order_id for o in arrival] == ids
+    checks["sides_add_up"] = len(book.buys) + len(book.sells) == n_orders
+
+    found, lookup_s = timed(
+        lambda: all(book.get_order(i) is not None for i in ids)
+    )
+    checks["every_id_found"] = found
+    checks["best_prices_correct_before_cancel"] = _best_prices_match(book)
+
+    n_cancel = int(n_orders * cancel_fraction)
+    cancelled = rng.sample(ids, n_cancel)
+    cancelled_set = set(cancelled)
+
+    results, cancel_s = timed(
+        lambda: [book.cancel_order(i) for i in cancelled]
+    )
+    remaining = [i for i in ids if i not in cancelled_set]
+
+    checks["cancels_succeeded"] = all(results)
+    checks["cancelled_orders_gone"] = all(
+        book.get_order(i) is None for i in cancelled
+    )
+    checks["count_after_cancel"] = len(book) == n_orders - n_cancel
+    checks["arrival_order_after_cancel"] = (
+        [o.order_id for o in book.get_orders_in_arrival_order()] == remaining
+    )
+    checks["best_prices_correct_after_cancel"] = _best_prices_match(book)
+    checks["cancelling_again_returns_false"] = not any(
+        book.cancel_order(i) for i in cancelled[:100]
+    )
+
+    return {
+        "orders": n_orders,
+        "cancelled": n_cancel,
+        "payload_bytes": len(payload),
+        "encode_s": encode_s,
+        "decode_s": decode_s,
+        "ingest_s": ingest_s,
+        "ingest_encoded_s": ingest_encoded_s,
+        "lookup_s": lookup_s,
+        "cancel_s": cancel_s,
+        "encode_rate": n_orders / encode_s,
+        "decode_rate": n_orders / decode_s,
+        "ingest_rate": n_orders / ingest_s,
+        "ingest_encoded_rate": n_orders / ingest_encoded_s,
+        "lookup_rate": n_orders / lookup_s,
+        "cancel_rate": max(n_cancel, 1) / cancel_s,
+        "checks": checks,
+        "ok": all(checks.values()),
+    }
+
+
+def format_load_report(r: dict) -> str:
+    lines = [
+        f"LOAD TEST: {r['orders']:,} orders, {r['cancelled']:,} cancelled, "
+        f"payload {r['payload_bytes']:,} bytes",
+        f"  encode            {r['encode_s']:8.3f} s  {r['encode_rate']:>12,.0f} /s",
+        f"  decode            {r['decode_s']:8.3f} s  {r['decode_rate']:>12,.0f} /s",
+        f"  ingest (dicts)    {r['ingest_s']:8.3f} s  {r['ingest_rate']:>12,.0f} /s",
+        f"  ingest (encoded)  {r['ingest_encoded_s']:8.3f} s  "
+        f"{r['ingest_encoded_rate']:>12,.0f} /s",
+        f"  lookup            {r['lookup_s']:8.3f} s  {r['lookup_rate']:>12,.0f} /s",
+        f"  cancel            {r['cancel_s']:8.3f} s  {r['cancel_rate']:>12,.0f} /s",
+        "  checks:",
+    ]
+    lines += [
+        f"    {'ok  ' if ok else 'FAIL'} {name}"
+        for name, ok in r["checks"].items()
+    ]
+    lines.append("  RESULT: " + ("ALL CHECKS PASSED" if r["ok"] else "FAILED"))
+    return "\n".join(lines)
+
+
+# ============================================================
+# DAY 14: ZERO-COPY ARCHITECTURE VERIFICATION
+# ============================================================
+
+_ZC_TEST_VALUE = 123456789
+
+
+def _zero_copy_child(name: str, ready, done) -> None:
+    """Child process: write a number straight into the shared block."""
+
+    from multiprocessing import shared_memory
+
+    shm = shared_memory.SharedMemory(name=name)
+    shm.buf[0:8] = struct.pack("<Q", _ZC_TEST_VALUE)
+    ready.set()
+    done.wait(30)
+    shm.close()
+
+
+def verify_zero_copy(n_orders: int = 2000) -> dict:
+    """Measure where data is shared and where it is copied.
+
+    Checks 1-3 prove the transport is zero-copy. Check 4 measures the order
+    book intake, which is expected to copy (it builds Python objects).
+    """
+
+    import multiprocessing as mp
+    from multiprocessing import shared_memory
+
+    checks: list[dict] = []
+
+    def add(name: str, passed: bool, detail: str) -> None:
+        checks.append({"check": name, "passed": bool(passed), "detail": detail})
+
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+
+    try:
+        # 1. A memoryview slice shares memory and allocates (almost) nothing.
+        buf = bytearray(1_000_000)
+        mv = memoryview(buf)
+        before = tracemalloc.get_traced_memory()[0]
+        window = mv[1000:900_000]
+        growth = tracemalloc.get_traced_memory()[0] - before
+        buf[1000] = 99
+        add("memoryview slice is zero-copy",
+            window[0] == 99 and window.obj is buf and growth < 4096,
+            f"slice of 899,000 bytes used {growth} extra bytes and saw a "
+            "later write")
+        window.release()
+
+        # 2. bytes(...) of the same slice is a real copy.
+        mv_slice = mv[1000:900_000]
+        copied = bytes(mv_slice)
+        buf[1000] = 7
+        add("bytes(view[...]) makes an independent copy",
+            copied[0] == 99 and buf[1000] == 7,
+            "the copy kept the old value after the source changed")
+        mv_slice.release()
+        mv.release()
+
+        # 3. Two processes share one block with nothing sent through a pipe.
+        ctx = mp.get_context("spawn")
+        shm = shared_memory.SharedMemory(create=True, size=4096)
+        ready, done = ctx.Event(), ctx.Event()
+        proc = ctx.Process(target=_zero_copy_child, args=(shm.name, ready, done))
+        value = None
+        try:
+            proc.start()
+            if ready.wait(60):
+                value = struct.unpack_from("<Q", shm.buf, 0)[0]
+        finally:
+            done.set()
+            proc.join(10)
+            if proc.is_alive():
+                proc.terminate()
+            shm.close()
+            shm.unlink()
+        add("two processes share one memory block",
+            value == _ZC_TEST_VALUE,
+            f"parent read {value} written by the child; nothing was pickled "
+            "or sent through a pipe")
+
+        # 4. Order book intake: does it keep views of shared memory?
+        events = make_load_events(n_orders, seed=14)
+        payload = encode_events(events)
+        shm = shared_memory.SharedMemory(create=True, size=len(payload))
+        try:
+            shm.buf[:len(payload)] = payload
+
+            window = shm.buf[:len(payload)]
+            before = tracemalloc.get_traced_memory()[0]
+            decoded = decode_events(window)
+            grown = tracemalloc.get_traced_memory()[0] - before
+            window.release()
+
+            book = OrderBook()
+            window = shm.buf[:len(payload)]
+            book.ingest_encoded(window)
+            window.release()
+
+            shm.buf[:len(payload)] = bytes(len(payload))   # wipe the block
+
+            decoded_intact = decoded == events
+            book_intact = [
+                {"order_id": o.order_id, "side": o.side,
+                 "price": o.price, "quantity": o.quantity}
+                for o in book.get_orders_in_arrival_order()
+            ] == events
+        finally:
+            shm.close()
+            shm.unlink()
+
+        factor = grown / max(len(payload), 1)
+        copied_out = decoded_intact and book_intact
+        add("order book copies orders out of shared memory",
+            copied_out,
+            f"{len(payload):,} shared bytes became {grown:,} bytes of Python "
+            f"objects ({factor:.1f}x); orders survived the block being wiped")
+
+    finally:
+        if started_tracing:
+            tracemalloc.stop()
+
+    transport_ok = all(c["passed"] for c in checks[:3])
+
+    return {
+        "checks": checks,
+        "transport_zero_copy": transport_ok,
+        "book_is_zero_copy": not checks[3]["passed"],
+        "memory_growth_factor": factor,
+        "ok": all(c["passed"] for c in checks),
+    }
+
+
+def format_zero_copy_report(z: dict) -> str:
+    lines = ["ZERO-COPY VERIFICATION"]
+    for c in z["checks"]:
+        lines.append(f"  {'ok  ' if c['passed'] else 'FAIL'} {c['check']}")
+        lines.append(f"       {c['detail']}")
+    lines += [
+        f"  Transport (shared memory) is zero-copy: {z['transport_zero_copy']}",
+        f"  Order book is zero-copy: {z['book_is_zero_copy']} "
+        f"(decoded data is {z['memory_growth_factor']:.1f}x larger in Python "
+        "objects)",
+        "  RESULT: " + ("VERIFIED" if z["ok"] else "FAILED"),
+    ]
+    return "\n".join(lines)
+
+
+# ============================================================
+# BASIC DAY 1-14 DEMONSTRATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    import sys
+
+    if "--load" in sys.argv:
+        n = 50_000
+        if "--orders" in sys.argv:
+            n = int(sys.argv[sys.argv.index("--orders") + 1].replace(",", ""))
+        report = run_load_test(n)
+        print(format_load_report(report))
+        sys.exit(0 if report["ok"] else 1)
+
+    if "--zero-copy" in sys.argv:
+        report = verify_zero_copy()
+        print(format_zero_copy_report(report))
+        sys.exit(0 if report["ok"] else 1)
+
+    book = OrderBook()
+
+    book.add_order(Order("B001", BUY, 100.50, 10))
+    book.add_order(Order("B002", BUY, 101.00, 20))
+    book.add_order(Order("S001", SELL, 102.50, 15))
+    book.add_order(Order("S002", SELL, 103.00, 25))
+
+    print("BUY ORDERS:")
+    for order in book.get_orders(BUY):
+        print(order)
+
+    print("\nSELL ORDERS:")
+    for order in book.get_orders(SELL):
+        print(order)
+
+    print("\nLOOKUP B001:")
+    print(book.get_order("B001"))
+
+    print("\nBEST BID:", book.best_bid())
+    print("BEST ASK:", book.best_ask())
+
+    print("\nARRIVAL ORDER:")
+    for order in book.get_orders_in_arrival_order():
+        print(order)
+
+    ipc_events = [
+        {
+            "order_id": "B003",
+            "side": BUY,
+            "price": 99.50,
+            "quantity": 5
+        }
+    ]
+
+    binary_payload = encode_events(ipc_events)
+    decoded_events = decode_events(binary_payload)
+
+    print("\nDECODED IPC EVENTS:")
+    print(decoded_events)
+
+    ipc_book = OrderBook()
+    ingested = ingest_encoded(ipc_book, binary_payload)
+
+    print("\nIPC EVENTS INGESTED:", ingested)
+    print("IPC BOOK TOTAL ORDERS:", len(ipc_book))
+
+    print("\nTOTAL ORIGINAL BOOK ORDERS:", len(book))
