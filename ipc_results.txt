@@ -1,0 +1,40 @@
+CHRONOSMATCH - IPC ANALYSIS - Teammate 3 - 2026-11-08
+50,000 messages per method, 2 processes, Python 3.14.3
+
+method                                                 msgs/s  time s   p50 ms   p99 ms cpu send cpu recv  check
+----------------------------------------------------------------------------------------------------------------
+No IPC: pack + unpack in one process (ceiling)        804,135    0.06     0.00     0.00    0.05s    0.00s  ok
+Queue, 1 message per put                               83,897    0.60   286.68   516.73    0.06s    0.50s  ok
+Queue, 1000 messages per put                        1,298,428    0.04    19.69    23.68    0.02s    0.03s  ok
+Pipe, 1 message per send (struct)                      92,134    0.54    20.11    31.01    0.48s    0.55s  ok
+Pipe, 1000 messages per send (struct)               1,413,643    0.04     1.40     2.36    0.05s    0.05s  ok
+Shared memory, 1 message per publish                  674,448    0.07     0.00     0.03    0.08s    0.09s  ok
+Shared memory, 1000 messages per publish              963,950    0.05     1.31     2.14    0.05s    0.06s  ok
+Queue (batches) -> OrderBook                          207,692    0.24   103.62   223.61    0.02s    0.23s  ok
+Shared memory ring -> OrderBook                       220,254    0.23    21.03   110.33    0.05s    0.22s  ok
+
+FINDINGS
+  - Fastest IPC method: Pipe, 1000 messages per send (struct) at 1,413,643 messages/s (16.8x the plain Queue).
+  - Queue: batching 1,000 messages changes speed 15.5x and median delay from 286.68 ms to 19.69 ms.
+  - Pipe: batching 1,000 messages changes speed 15.3x and median delay from 20.11 ms to 1.40 ms.
+  - Shared memory: batching 1,000 messages changes speed 1.4x and median delay from 0.00 ms to 1.31 ms.
+  - Lowest median delay: Shared memory, 1 message per publish at 0.00 ms (p99 0.03 ms). Batching raises speed but adds waiting time.
+  - Shared memory reaches 120% of the no-IPC ceiling, so most of its time is encoding and decoding, not transport.
+  - Feeding the order book drops shared memory from 963,950 to 220,254 messages/s: from here the order book, not IPC, sets the pace.
+
+How to read the table
+  msgs/s     messages delivered per second, from the first send to the last receive
+  p50 / p99  delay of a sampled message: time between its creation and its arrival.
+             Under load this includes waiting in the queue, so it is a loaded-system delay.
+  cpu send / cpu recv   CPU seconds each process used (a process that spins while waiting
+             for data uses CPU even when idle)
+  check      every message arrived once, in order, and the quantities add up
+
+Copies of one order before it is usable by the receiver
+  multiprocessing.Queue   pickle it (copy 1) -> pipe, kernel buffer (copy 2) -> read (copy 3)
+                          -> unpickle into new Python objects (copy 4)
+  Pipe + struct           pack into bytes (copy 1) -> kernel buffer (copy 2) -> read (copy 3)
+                          -> unpack (4)
+  Shared-memory ring      pack straight into memory both programs can see (the only write),
+                          unpack straight out of it. Nothing is copied between the programs.
+
