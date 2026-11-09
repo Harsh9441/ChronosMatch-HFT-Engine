@@ -1,6 +1,6 @@
 """
 ChronosMatch - Order Book (Teammate 3)
-Combined Day 1-17 implementation.
+Combined Day 1-19 implementation.
 
 Day 1: Basic order-book structure.
 Day 2: Insert buy/sell orders with validation.
@@ -20,24 +20,32 @@ Day 15: Final benchmark report: python orderbook.py --report [--quick] [--skip-t
 Day 16: Database layer (SQLite) joining the order book and a matching
         engine: python orderbook.py --database
 Day 17: Trade persistence validation: python orderbook.py --persistence
+Day 18: Missing and failed records (quarantine, retry, reconcile):
+        python orderbook.py --failures
+Day 19: Recovery and resiliency testing: python orderbook.py --resilience
+Check an existing database file: python orderbook.py --validate-db FILE
+Test count per file (no run): python orderbook.py --count-tests
 
 This is a storage/order-book module, not a full matching engine.
 """
 
 import heapq
+import json
 import math
 import os
 import platform
 import random
+import re
 import sqlite3
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import tracemalloc
 
 from collections.abc import AsyncIterable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import count
 from typing import Optional
 
@@ -1027,6 +1035,15 @@ CREATE TABLE IF NOT EXISTS events (
     kind  TEXT NOT NULL,
     ref   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rejected (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind      TEXT    NOT NULL CHECK (kind IN ('order', 'trade', 'cancel')),
+    ref       TEXT,
+    reason    TEXT    NOT NULL,
+    payload   TEXT,
+    resolved  INTEGER NOT NULL DEFAULT 0 CHECK (resolved IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS idx_rejected_open ON rejected(resolved, kind);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_trades_buy    ON trades(buy_order_id);
 CREATE INDEX IF NOT EXISTS idx_trades_sell   ON trades(sell_order_id);
@@ -1034,17 +1051,54 @@ CREATE INDEX IF NOT EXISTS idx_events_ref    ON events(kind, ref);
 """
 
 
+def _to_json(value) -> str:
+    """Keep a copy of a rejected record as text, whatever it is."""
+
+    if isinstance(value, Trade):
+        value = asdict(value)
+
+    try:
+        return json.dumps(value, default=repr)
+    except (TypeError, ValueError):
+        return json.dumps(repr(value))
+
+
+def _trade_ref(trade):
+    ref = trade.get("trade_id") if isinstance(trade, Mapping) else None
+    return ref if isinstance(ref, str) else None
+
+
 def _chunks(items: list, size: int = 500):
     for start in range(0, len(items), size):
         yield items[start:start + size]
 
 
+class DatabaseBusyError(RuntimeError):
+    """The database stayed locked or busy after every retry."""
+
+
 class OrderDatabase:
     """Tables and operations. Every write is one all-or-nothing transaction."""
 
-    def __init__(self, path: str = ":memory:") -> None:
+    def __init__(self, path: str = ":memory:", read_only: bool = False,
+                 retries: int = 3, timeout: float = 5.0) -> None:
         self.path = path
-        self.conn = sqlite3.connect(path)
+        self.retries = retries
+
+        if read_only:
+            # Open an existing file for reading only: nothing can be changed.
+            from pathlib import Path
+
+            if path == ":memory:" or not os.path.exists(path):
+                raise FileNotFoundError(f"No database file at {path}")
+
+            self.conn = sqlite3.connect(
+                Path(path).resolve().as_uri() + "?mode=ro", uri=True
+            )
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            return
+
+        self.conn = sqlite3.connect(path, timeout=timeout)
         self.conn.execute("PRAGMA foreign_keys = ON")
 
         if path != ":memory:":
@@ -1067,8 +1121,27 @@ class OrderDatabase:
     # ORDERS
     # --------------------------------------------------------
 
-    def save_orders(self, orders: Iterable[Order]) -> int:
-        """Store new orders. If any is refused, none are stored."""
+    def _write_quarantine(self, rejected, resolve) -> None:
+        """Quarantine and resolve rows, inside the caller's transaction."""
+
+        if rejected:
+            self.conn.executemany(
+                "INSERT INTO rejected (kind, ref, reason, payload) "
+                "VALUES (?, ?, ?, ?)", list(rejected)
+            )
+
+        if resolve:
+            self.conn.executemany(
+                "UPDATE rejected SET resolved = 1 WHERE id = ?",
+                [(i,) for i in resolve]
+            )
+
+    def _save_orders_once(self, orders: Iterable[Order], rejected=(),
+                          resolve=()) -> int:
+        """Store new orders. If any is refused, none are stored.
+
+        Quarantine rows for bad events are saved in the same transaction.
+        """
 
         rows = []
 
@@ -1086,26 +1159,31 @@ class OrderDatabase:
                 (order.order_id, order.side, float(order.price), order.quantity)
             )
 
-        if not rows:
+        if not rows and not rejected and not resolve:
             return 0
 
         with self.conn:
-            try:
-                self.conn.executemany(
-                    "INSERT INTO orders (order_id, side, price, quantity) "
-                    "VALUES (?, ?, ?, ?)", rows
-                )
-            except sqlite3.IntegrityError as exc:
-                raise ValueError(f"Database refused the orders: {exc}") from exc
+            if rows:
+                try:
+                    self.conn.executemany(
+                        "INSERT INTO orders (order_id, side, price, quantity) "
+                        "VALUES (?, ?, ?, ?)", rows
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(
+                        f"Database refused the orders: {exc}"
+                    ) from exc
 
-            self.conn.executemany(
-                "INSERT INTO events (kind, ref) VALUES ('order', ?)",
-                [(row[0],) for row in rows]
-            )
+                self.conn.executemany(
+                    "INSERT INTO events (kind, ref) VALUES ('order', ?)",
+                    [(row[0],) for row in rows]
+                )
+
+            self._write_quarantine(rejected, resolve)
 
         return len(rows)
 
-    def mark_cancelled(self, order_id: str) -> bool:
+    def _mark_cancelled_once(self, order_id: str) -> bool:
         """Mark an open or partly filled order cancelled. False if none."""
 
         with self.conn:
@@ -1191,6 +1269,119 @@ class OrderDatabase:
         return done
 
     # --------------------------------------------------------
+    # DAY 18: RETRIES, QUARANTINE, STATUS LOOKUP
+    # --------------------------------------------------------
+
+    def _retry(self, action):
+        """Run a write; retry with a short pause if the database is busy."""
+
+        delay = 0.05
+
+        for attempt in range(self.retries + 1):
+            try:
+                return action()
+            except sqlite3.OperationalError as exc:
+                text = str(exc).lower()
+                busy = "locked" in text or "busy" in text
+
+                if not busy:
+                    raise
+
+                if attempt == self.retries:
+                    raise DatabaseBusyError(
+                        f"Database stayed busy after {self.retries + 1} tries: {exc}"
+                    ) from exc
+
+                time.sleep(delay)
+                delay *= 2
+
+    def save_orders(self, orders: Iterable[Order], rejected=None,
+                    resolve=None) -> int:
+        """Store new orders. If any is refused, none are stored."""
+        orders = list(orders)
+        rejected = list(rejected or [])
+        resolve = list(resolve or [])
+        return self._retry(
+            lambda: self._save_orders_once(orders, rejected, resolve)
+        )
+
+    def mark_cancelled(self, order_id: str) -> bool:
+        """Mark an open or partly filled order cancelled. False if none."""
+        return self._retry(lambda: self._mark_cancelled_once(order_id))
+
+    def save_trades(self, trades: Iterable, rejected=None, resolve=None) -> int:
+        """Store trades and update fills. The whole batch or nothing."""
+        trades = list(trades)
+        rejected = list(rejected or [])
+        resolve = list(resolve or [])
+        return self._retry(
+            lambda: self._save_trades_once(trades, rejected, resolve)
+        )
+
+    def statuses(self, ids: Iterable[str]) -> dict[str, str]:
+        """Status of each known order ID (unknown IDs are left out)."""
+
+        ids = list(set(ids))
+        found: dict[str, str] = {}
+
+        for chunk in _chunks(ids):
+            marks = ",".join("?" * len(chunk))
+            found.update(self.conn.execute(
+                f"SELECT order_id, status FROM orders "
+                f"WHERE order_id IN ({marks})", chunk
+            ))
+
+        return found
+
+    def save_rejected(self, records: Iterable[tuple]) -> int:
+        """Quarantine records as (kind, ref, reason, payload) tuples."""
+
+        rows = list(records)
+
+        if not rows:
+            return 0
+
+        def write():
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO rejected (kind, ref, reason, payload) "
+                    "VALUES (?, ?, ?, ?)", rows
+                )
+
+        self._retry(write)
+        return len(rows)
+
+    def rejected_records(self, unresolved_only: bool = True) -> list[tuple]:
+        """(id, kind, ref, reason, payload) for quarantined records."""
+
+        where = "WHERE resolved = 0 " if unresolved_only else ""
+        return self.conn.execute(
+            "SELECT id, kind, ref, reason, payload FROM rejected "
+            + where + "ORDER BY id"
+        ).fetchall()
+
+    def count_rejected(self, unresolved_only: bool = True) -> int:
+        where = "WHERE resolved = 0" if unresolved_only else ""
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM rejected " + where
+        ).fetchone()[0]
+
+    def resolve_rejected(self, ids: Iterable[int]) -> int:
+        ids = list(ids)
+
+        def write():
+            with self.conn:
+                self.conn.executemany(
+                    "UPDATE rejected SET resolved = 1 WHERE id = ?",
+                    [(i,) for i in ids]
+                )
+
+        if ids:
+            self._retry(write)
+
+        return len(ids)
+
+    # --------------------------------------------------------
     # TRADES
     # --------------------------------------------------------
 
@@ -1231,18 +1422,22 @@ class OrderDatabase:
             "FROM orders WHERE order_id = ?", (order_id,)
         ).fetchone()
 
-    def save_trades(self, trades: Iterable) -> int:
+    def _save_trades_once(self, trades: Iterable, rejected=(),
+                          resolve=()) -> int:
         """Store trades and update each order's fill and status.
 
-        The whole batch is saved or none of it is.
+        The whole batch is saved or none of it is, including any quarantine
+        rows saved with it.
         """
 
         trades = list(trades)
 
-        if not trades:
+        if not trades and not rejected and not resolve:
             return 0
 
         with self.conn:
+            self._write_quarantine(rejected, resolve)
+
             for n, trade in enumerate(trades, start=1):
                 trade_id, buy_id, sell_id, price, qty = self._trade_fields(n, trade)
 
@@ -1454,6 +1649,7 @@ class PersistentBook:
                  book: OrderBook | None = None) -> None:
         self.db = db if db is not None else OrderDatabase()
         self.book = book if book is not None else OrderBook()
+        self.needs_reconcile = False       # set if a cleanup failed after a commit
 
     @classmethod
     def restore(cls, db: OrderDatabase) -> "PersistentBook":
@@ -1466,7 +1662,8 @@ class PersistentBook:
 
         return cls(db, book)
 
-    def submit(self, events: Iterable[Mapping]) -> int:
+    def submit(self, events: Iterable[Mapping], rejected=None,
+               resolve=None) -> int:
         """Add order events to the book and the database.
 
         An ID that the database has seen before (even a cancelled one) is
@@ -1489,19 +1686,37 @@ class PersistentBook:
                     )
 
         before = len(self.book)
+        error = None
+        result = 0
 
         try:
-            return self.book.ingest_firehose(events)
-        finally:
-            added = self.book.get_orders_in_arrival_order()[before:]
-            if added:
-                self.db.save_orders(added)
+            result = self.book.ingest_firehose(events)
+        except Exception as exc:                          # noqa: BLE001
+            error = exc
+
+        added = self.book.get_orders_in_arrival_order()[before:]
+
+        if added or rejected or resolve:
+            try:
+                self.db.save_orders(added, rejected, resolve)
+            except Exception:
+                # The database refused or failed: undo the book so the two
+                # never disagree, then report the real problem.
+                for order in added:
+                    self.book.cancel_order(order.order_id)
+                raise
+
+        if error is not None:
+            raise error
+
+        return result
 
     def cancel(self, order_id: str) -> bool:
-        if not self.book.cancel_order(order_id):
+        if self.book.get_order(order_id) is None:
             return False
 
-        self.db.mark_cancelled(order_id)
+        self.db.mark_cancelled(order_id)       # if this fails, nothing changed
+        self.book.cancel_order(order_id)
         return True
 
     def record_trades(self, trades: Iterable[Trade]) -> int:
@@ -1517,22 +1732,284 @@ class PersistentBook:
 
         touched = ({t.buy_order_id for t in trades}
                    | {t.sell_order_id for t in trades})
-
-        for order_id in self.db.filled_ids(touched):
-            self.book.cancel_order(order_id)
+        self._drop_filled(touched)
 
         return saved
 
-    def run_engine(self, engine=reference_match) -> int:
+    def _drop_filled(self, touched: set) -> None:
+        """Remove fully filled orders from the book. The trades are already
+        saved, so a failure here is not reported as a failed save; the book is
+        flagged and repaired before the next engine run."""
+
+        try:
+            for order_id in self.db.filled_ids(touched):
+                self.book.cancel_order(order_id)
+        except sqlite3.Error:
+            self.needs_reconcile = True
+
+    def run_engine(self, engine=reference_match, tolerant: bool = False) -> int:
         """Run a matching engine on the book and store what it produces.
 
         engine(book, filled, first_trade_number) must return Trade objects.
+        With tolerant=True, bad trades are quarantined and the good ones are
+        still stored; otherwise one bad trade refuses the whole batch.
         """
+
+        if self.needs_reconcile:
+            self.reconcile(repair=True)
 
         trades = list(engine(
             self.book, self.db.filled_map(), self.db.next_trade_number()
         ))
+
+        if tolerant:
+            return self.record_trades_tolerant(trades)["saved"]
+
         return self.record_trades(trades)
+
+    # --------------------------------------------------------
+    # DAY 18: MISSING AND FAILED RECORDS
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _event_problem(event, known: set, seen: set):
+        """Why an order event cannot be stored, or None if it is fine."""
+
+        if not isinstance(event, Mapping):
+            return "event is not a mapping"
+
+        for field in ("order_id", "side", "price", "quantity"):
+            if field not in event:
+                return f"missing field {field!r}"
+
+        try:
+            _check_fields("", event["order_id"], event["side"],
+                          event["price"], event["quantity"])
+        except ValueError as exc:
+            return str(exc).lstrip(": ")
+
+        if event["quantity"] > _MAX_INT:
+            return "quantity too large for the database"
+
+        order_id = event["order_id"]
+
+        if order_id in known:
+            return f"order ID {order_id!r} was used before"
+
+        if order_id in seen:
+            return f"duplicate order ID {order_id!r} in this batch"
+
+        seen.add(order_id)
+        return None
+
+    def submit_tolerant(self, events: Iterable, quarantine: bool = True,
+                        resolves=None) -> dict:
+        """Store every good order event; quarantine the bad ones.
+
+        Unlike submit(), a bad event never stops the others. Quarantined
+        events (with the reason and the original data) go to the rejected
+        table so nothing is silently lost.
+        """
+
+        events = list(events)
+        ids = [e["order_id"] for e in events
+               if isinstance(e, Mapping) and isinstance(e.get("order_id"), str)]
+        known = self.db.known_ids(ids)
+        seen: set = set()
+
+        good, good_positions, rejected = [], [], []
+
+        for n, event in enumerate(events, start=1):
+            reason = self._event_problem(event, known, seen)
+
+            if reason is None:
+                good.append(event)
+                good_positions.append(n)
+            else:
+                ref = event.get("order_id") if isinstance(event, Mapping) else None
+                rejected.append((
+                    "order", ref if isinstance(ref, str) else None,
+                    f"Firehose event {n}: {reason}", _to_json(event)
+                ))
+
+        good_resolve = ([resolves[p - 1] for p in good_positions]
+                        if resolves else None)
+
+        if good or (quarantine and rejected) or good_resolve:
+            self.submit(good, rejected=rejected if quarantine else None,
+                        resolve=good_resolve)
+
+        return {"accepted": len(good), "rejected": len(rejected),
+                "accepted_positions": good_positions}
+
+    def record_trades_tolerant(self, trades: Iterable, max_failures: int = 100,
+                               quarantine: bool = True, resolves=None) -> dict:
+        """Store every good trade; quarantine the bad ones.
+
+        Raises RuntimeError (and stores nothing) if more than max_failures
+        trades are bad, which usually means the engine itself is broken.
+        """
+
+        trades = list(trades)
+        rejected: list[tuple] = []          # (position, ref, reason, payload)
+        items: list[tuple] = []             # (position, Trade)
+
+        for n, trade in enumerate(trades, start=1):
+            if isinstance(trade, Trade):
+                items.append((n, trade))
+            elif isinstance(trade, Mapping):
+                try:
+                    items.append((n, Trade(
+                        trade["trade_id"], trade["buy_order_id"],
+                        trade["sell_order_id"], trade["price"],
+                        trade["quantity"])))
+                except KeyError as exc:
+                    rejected.append((n, _trade_ref(trade),
+                                     f"missing field {exc}", _to_json(trade)))
+            else:
+                rejected.append((n, None, "not a trade", _to_json(trade)))
+
+        problems: dict[int, list[str]] = {}
+        for problem in check_trades(self.book, [t for _, t in items]):
+            match = re.match(r"Trade (\d+): (.*)", problem)
+            problems.setdefault(int(match.group(1)), []).append(match.group(2))
+
+        good: list[tuple] = []
+        for k, (n, trade) in enumerate(items, start=1):
+            if k in problems:
+                rejected.append((n, trade.trade_id, "; ".join(problems[k]),
+                                 _to_json(trade)))
+            else:
+                good.append((n, trade))
+
+        def too_many():
+            return RuntimeError(
+                f"{len(rejected)} bad trades (limit {max_failures}); "
+                "nothing was stored"
+            )
+
+        if len(rejected) > max_failures:
+            raise too_many()
+
+        while True:
+            try:
+                saved = self.db.save_trades(
+                    [t for _, t in good],
+                    rejected=[("trade", ref, reason, payload)
+                              for _, ref, reason, payload in rejected]
+                    if quarantine else None,
+                    resolve=[resolves[n - 1] for n, _ in good]
+                    if resolves else None,
+                )
+                break
+            except ValueError as exc:
+                match = re.match(r"Trade (\d+): (.*)", str(exc))
+                if not match:
+                    raise
+                n, trade = good.pop(int(match.group(1)) - 1)
+                rejected.append((n, trade.trade_id, match.group(2),
+                                 _to_json(trade)))
+                if len(rejected) > max_failures:
+                    raise too_many() from exc
+
+        if good:
+            self._drop_filled({t.buy_order_id for _, t in good}
+                              | {t.sell_order_id for _, t in good})
+
+        return {"saved": saved, "rejected": len(rejected),
+                "saved_positions": [n for n, _ in good]}
+
+    def reconcile(self, repair: bool = False) -> dict:
+        """Compare the in-memory book with the database.
+
+        Finds orders the database never received (unsaved), orders that are
+        finished but still resting in the book (stale), orders open in the
+        database but missing from the book (missing) and orders whose terms
+        differ (mismatched). With repair=True the first three are fixed;
+        mismatches are only reported. A re-added order goes to the END of the
+        book's arrival order; a restart restores the original order.
+        """
+
+        book_orders = {o.order_id: o
+                       for o in self.book.get_orders_in_arrival_order()}
+        db_open = {o.order_id: o for o in self.db.load_open_orders()}
+        statuses = self.db.statuses(list(book_orders))
+
+        unsaved = [i for i in book_orders if i not in statuses]
+        stale = [i for i, st in statuses.items() if st in ("filled", "cancelled")]
+        missing = [i for i in db_open if i not in book_orders]
+        mismatched = [
+            i for i in book_orders if i in db_open and
+            (book_orders[i].side, book_orders[i].price, book_orders[i].quantity)
+            != (db_open[i].side, db_open[i].price, db_open[i].quantity)
+        ]
+
+        consistent_before = not (unsaved or stale or missing or mismatched)
+        repaired = 0
+
+        if repair:
+            if unsaved:
+                self.db.save_orders([book_orders[i] for i in unsaved])
+                repaired += len(unsaved)
+            for order_id in stale:
+                self.book.cancel_order(order_id)
+                repaired += 1
+            for order_id in missing:
+                self.book.add_order(db_open[order_id])
+                repaired += 1
+
+        if repair:
+            self.needs_reconcile = False
+
+        return {
+            "unsaved_in_database": unsaved,
+            "stale_in_book": stale,
+            "missing_in_book": missing,
+            "mismatched": mismatched,
+            "repaired": repaired,
+            "unresolved_rejected": self.db.count_rejected(),
+            "consistent_before": consistent_before,
+            "consistent_after": (not mismatched) if repair else consistent_before,
+        }
+
+    def retry_rejected(self) -> dict:
+        """Try every unresolved quarantined order and trade again.
+
+        Useful when the cause was timing, for example a trade that arrived
+        before its orders. Records that now succeed are marked resolved; the
+        rest stay in quarantine (they are not quarantined a second time).
+        """
+
+        rows = self.db.rejected_records()
+        order_rows, trade_rows = [], []
+
+        for rid, kind, _ref, _reason, payload in rows:
+            try:
+                data = json.loads(payload) if payload else None
+            except ValueError:
+                continue
+
+            if isinstance(data, dict):
+                (order_rows if kind == "order" else trade_rows
+                 if kind == "trade" else []).append((rid, data))
+
+        resolved_orders = resolved_trades = 0
+
+        if order_rows:
+            result = self.submit_tolerant(
+                [d for _, d in order_rows], quarantine=False,
+                resolves=[rid for rid, _ in order_rows])
+            resolved_orders = len(result["accepted_positions"])
+
+        if trade_rows:
+            result = self.record_trades_tolerant(
+                [d for _, d in trade_rows], max_failures=len(trade_rows),
+                quarantine=False, resolves=[rid for rid, _ in trade_rows])
+            resolved_trades = len(result["saved_positions"])
+
+        return {"orders_resolved": resolved_orders,
+                "trades_resolved": resolved_trades,
+                "still_failing": self.db.count_rejected()}
 
 
 # ============================================================
@@ -1877,8 +2354,800 @@ def format_persistence_report(r: dict) -> str:
     return "\n".join(lines)
 
 
+def validate_database_file(path: str, expect_matched: bool = True) -> dict:
+    """Validate an existing database file. The file is opened read-only."""
+
+    db = OrderDatabase(path, read_only=True)
+
+    try:
+        result = validate_trade_persistence(db, expect_matched)
+    finally:
+        db.close()
+
+    result["path"] = path
+    return result
+
+
+def format_validation_report(r: dict) -> str:
+    lines = [
+        f"TRADE PERSISTENCE CHECK: {r['path']}",
+        f"  {r['orders']:,} orders, {r['trades']:,} trades",
+        "  checks:",
+    ]
+    lines += [f"    {'ok  ' if ok else 'FAIL'} {name}"
+              for name, ok in r["checks"].items()]
+    lines += [f"    problem: {p}" for p in r["problems"]]
+    lines.append("  RESULT: " + ("ALL CHECKS PASSED" if r["ok"] else "FAILED"))
+    return "\n".join(lines)
+
+
 # ============================================================
-# BENCHMARK REPORT (DAYS 11-17)
+# DAY 18: HANDLING MISSING AND FAILED RECORDS (DEMO RUN)
+# ============================================================
+
+def run_failure_handling_demo(n_orders: int = 20_000) -> dict:
+    """Feed the database layer bad orders, bad trades and a failing database,
+    then check that nothing is lost, nothing disagrees and good data survives."""
+
+    events = make_load_events(n_orders, seed=18)
+
+    breakers = [
+        lambda e: {k: v for k, v in e.items() if k != "price"},     # missing field
+        lambda e: {**e, "price": -1.0},                              # negative price
+        lambda e: {**e, "quantity": 0},                              # zero quantity
+        lambda e: {**e, "price": float("nan")},                      # NaN price
+        lambda e: {**e, "side": "X"},                                # bad side
+        lambda e: None,                                              # not a mapping
+        lambda e: {**e, "order_id": "L0"},                           # reused ID
+        lambda e: {**e, "order_id": "   "},                          # blank ID
+        lambda e: {**e, "quantity": 2.5},                            # fractional
+        lambda e: {**e, "price": True},                              # boolean
+    ]
+    expected_bad = 0
+    for i in range(n_orders):
+        if i % 50 == 25:
+            events[i] = breakers[(i // 50) % len(breakers)](events[i])
+            expected_bad += 1
+
+    checks: dict[str, bool] = {}
+    folder = tempfile.TemporaryDirectory()
+    path = os.path.join(folder.name, "failures.db")
+    pb = PersistentBook(OrderDatabase(path))
+    other = None
+
+    try:
+        # 1. bad order events are quarantined, the good ones stored
+        accepted = rejected = 0
+        for start in range(0, n_orders, 1000):
+            result = pb.submit_tolerant(events[start:start + 1000])
+            accepted += result["accepted"]
+            rejected += result["rejected"]
+
+        stats = pb.db.stats()
+        checks["bad order events are quarantined, good ones stored"] = (
+            rejected == expected_bad and accepted == n_orders - expected_bad
+            and stats["orders"] == accepted and len(pb.book) == accepted
+            and pb.db.count_rejected() == expected_bad
+        )
+        sample = pb.db.rejected_records()
+        checks["every quarantined order keeps its reason and original data"] = all(
+            reason and (payload is not None) for _, _, _, reason, payload in sample
+        )
+
+        # 2. an ID that was cancelled can never come back
+        first_id = events[0]["order_id"]
+        pb.cancel(first_id)
+        again = pb.submit_tolerant([events[0]], quarantine=False)
+        checks["a cancelled order's ID cannot come back"] = (
+            again["accepted"] == 0 and again["rejected"] == 1
+        )
+
+        # 3. bad trades are quarantined, good trades stored
+        def messy_engine(book, filled, first_number):
+            real = reference_match(book, filled, first_number)
+            r0 = real[0]
+            return real + [
+                Trade("BADT1", "NO-SUCH-BUY", "NO-SUCH-SELL", 100.0, 1),
+                Trade("BADT2", r0.buy_order_id, r0.sell_order_id, r0.price, 10 ** 9),
+                Trade("BADT3", r0.sell_order_id, r0.buy_order_id, r0.price, 1),
+                Trade("BADT4", r0.buy_order_id, r0.sell_order_id, 10 ** 6, 1),
+                Trade(r0.trade_id, r0.buy_order_id, r0.sell_order_id, r0.price, 1),
+                "garbage",
+                {"trade_id": "BADT7"},
+            ], len(real)
+
+        engine_out = {}
+
+        def engine(book, filled, first_number):
+            trades, engine_out["real"] = messy_engine(book, filled, first_number)
+            return trades
+
+        before_trades = pb.db.stats()["trades"]
+        got = pb.record_trades_tolerant(
+            list(engine(pb.book, pb.db.filled_map(), pb.db.next_trade_number()))
+        )
+        checks["bad trades are quarantined, good trades stored"] = (
+            got["saved"] == engine_out["real"] and got["rejected"] == 7
+            and pb.db.stats()["trades"] == before_trades + engine_out["real"]
+        )
+        checks["stored data still validates after quarantining"] = (
+            validate_trade_persistence(pb.db)["ok"]
+        )
+
+        # 4. a failed database write rolls the book back
+        book_before, db_before = len(pb.book), pb.db.stats()["orders"]
+        extra = [{"order_id": f"F{i}", "side": BUY, "price": 1.0, "quantity": 1}
+                 for i in range(3)]
+
+        def boom(*_args):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        pb.db._save_orders_once = boom
+        try:
+            pb.submit(extra)
+            raised = False
+        except sqlite3.OperationalError:
+            raised = True
+        finally:
+            del pb.db._save_orders_once
+
+        checks["a failed database write rolls the book back"] = (
+            raised and len(pb.book) == book_before
+            and pb.db.stats()["orders"] == db_before
+        )
+        pb.submit(extra)
+        checks["the book works again after a failed write"] = (
+            len(pb.book) == book_before + 3
+            and pb.db.stats()["orders"] == db_before + 3
+        )
+
+        # 5. a locked database gives a clear error and changes nothing
+        other = sqlite3.connect(path)
+        other.execute("BEGIN EXCLUSIVE")
+        pb.db.conn.execute("PRAGMA busy_timeout = 50")
+        pb.db.retries = 1
+        book_before = len(pb.book)
+        try:
+            pb.submit([{"order_id": "BUSY1", "side": BUY, "price": 1.0, "quantity": 1}])
+            busy_error = False
+        except DatabaseBusyError:
+            busy_error = True
+        checks["a busy database gives a clear error and changes nothing"] = (
+            busy_error and len(pb.book) == book_before
+        )
+        other.rollback()
+        other.close()
+        other = None
+        pb.db.conn.execute("PRAGMA busy_timeout = 5000")
+        pb.db.retries = 3
+        pb.submit([{"order_id": "BUSY1", "side": BUY, "price": 1.0, "quantity": 1}])
+        checks["writes succeed again once the lock is released"] = (
+            pb.db.get_order("BUSY1") is not None
+        )
+
+        # 6. book and database disagree: find it, then repair it
+        pb.book.add_order(Order("GHOST1", BUY, 1.0, 1))                 # never saved
+        open_one = pb.db.load_open_orders()[0]
+        pb.book.cancel_order(open_one.order_id)                         # lost from book
+        filled = pb.db.conn.execute(
+            "SELECT order_id, side, price, quantity FROM orders "
+            "WHERE status = 'filled' LIMIT 1"
+        ).fetchone()
+        pb.book.add_order(Order(*filled))                               # finished but resting
+
+        found = pb.reconcile()
+        checks["reconcile finds missing, unsaved and stale records"] = (
+            found["unsaved_in_database"] == ["GHOST1"]
+            and found["missing_in_book"] == [open_one.order_id]
+            and found["stale_in_book"] == [filled[0]]
+            and not found["consistent_before"]
+        )
+        pb.reconcile(repair=True)
+        checks["repair makes the book and database agree"] = (
+            pb.reconcile()["consistent_before"]
+        )
+
+        # 7. a trade that arrived before its orders is stored after a retry
+        def late_engine(book, filled, first_number):
+            return [Trade("TLATE", "LATE1", "LATE2", 100.0, 5)]
+
+        pb.run_engine(late_engine, tolerant=True)                       # orders not here yet
+        unresolved_before = pb.db.count_rejected()
+        pb.submit([
+            {"order_id": "LATE1", "side": BUY, "price": 101.0, "quantity": 5},
+            {"order_id": "LATE2", "side": SELL, "price": 100.0, "quantity": 5},
+        ])
+        retried = pb.retry_rejected()
+        late = pb.db.get_order("LATE1")
+        checks["a trade for a late-arriving order is stored after a retry"] = (
+            retried["trades_resolved"] == 1 and late["status"] == "filled"
+        )
+        checks["retrying leaves unrelated failures in quarantine"] = (
+            retried["still_failing"] == unresolved_before - 1
+            and retried["orders_resolved"] == 0
+        )
+        checks["nothing crosses and the data validates at the end"] = (
+            validate_trade_persistence(pb.db)["ok"]
+        )
+
+        return {
+            "orders": n_orders, "bad_events": expected_bad,
+            "quarantined": pb.db.count_rejected(),
+            "quarantined_ever": pb.db.count_rejected(unresolved_only=False),
+            "trades": pb.db.stats()["trades"],
+            "checks": checks, "ok": all(checks.values()),
+        }
+    finally:
+        if other is not None:
+            other.close()
+        pb.db.close()
+        folder.cleanup()
+
+
+def format_failure_report(r: dict) -> str:
+    lines = [
+        f"FAILURE HANDLING: {r['orders']:,} order events ({r['bad_events']:,} damaged), "
+        f"{r['trades']:,} trades stored",
+        f"  still in quarantine: {r['quarantined']:,} "
+        f"({r['quarantined_ever']:,} quarantined in total)",
+        "  checks:",
+    ]
+    lines += [f"    {'ok  ' if ok else 'FAIL'} {name}"
+              for name, ok in r["checks"].items()]
+    lines.append("  RESULT: " + ("ALL CHECKS PASSED" if r["ok"] else "FAILED"))
+    return "\n".join(lines)
+
+
+# ============================================================
+# DAY 19: RECOVERY AND RESILIENCY TESTING
+# ============================================================
+
+# Proves the data survives trouble: real processes killed mid-run, a failure
+# injected at every single database statement, an uncommitted transaction cut
+# off, a damaged database file replaced from a backup, and the same events
+# delivered twice. The common test is always the same: after the trouble, the
+# data is valid and the final result equals a run that never had any trouble.
+
+class FaultInjectingConnection:
+    """Wraps a sqlite3 connection and fails on one chosen statement.
+
+    A testing aid: statement number fail_at raises an OperationalError, as a
+    disk error would. Everything else passes through to the real connection.
+    """
+
+    def __init__(self, conn, fail_at: int | None = None) -> None:
+        self._conn = conn
+        self.fail_at = fail_at
+        self.statements = 0
+
+    def _tick(self) -> None:
+        self.statements += 1
+
+        if self.fail_at is not None and self.statements == self.fail_at:
+            raise sqlite3.OperationalError("disk I/O error (injected)")
+
+    def execute(self, *args, **kwargs):
+        self._tick()
+        return self._conn.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        self._tick()
+        return self._conn.executemany(*args, **kwargs)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _raw(db: "OrderDatabase"):
+    return getattr(db.conn, "_conn", db.conn)
+
+
+def _db_dump(db: "OrderDatabase") -> tuple:
+    conn = _raw(db)
+    return tuple(
+        conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+        for table in ("orders", "trades", "events", "rejected")
+    )
+
+
+def fault_sweep(make_state, operation, must_be_unchanged: bool = True):
+    """Run operation(pb) once per database statement, failing that statement.
+
+    After each failure the data must be unchanged (or, when part of the work
+    had already been committed, repairable), and running the operation again
+    must reach exactly the same final state as a run with no failure.
+    Returns (statements_tested, all_ok).
+    """
+
+    pb = make_state()
+    counter = FaultInjectingConnection(pb.db.conn)
+    pb.db.conn = counter
+    operation(pb)
+    total = counter.statements
+    pb.db.conn = counter._conn
+    final = (_db_dump(pb.db), pb.book.get_orders_in_arrival_order())
+    pb.db.close()
+
+    all_ok = total > 0
+
+    for k in range(1, total + 1):
+        pb = make_state()
+        before = (_db_dump(pb.db), pb.book.get_orders_in_arrival_order())
+        pb.db.conn = FaultInjectingConnection(pb.db.conn, fail_at=k)
+
+        try:
+            operation(pb)
+            raised = False
+        except sqlite3.OperationalError:
+            raised = True
+
+        pb.db.conn = pb.db.conn._conn
+        after = (_db_dump(pb.db), pb.book.get_orders_in_arrival_order())
+
+        if pb.needs_reconcile:
+            # The work was committed; only the book cleanup was cut short.
+            pb.reconcile(repair=True)
+            step_ok = (_db_dump(pb.db), pb.book.get_orders_in_arrival_order()) == final
+        else:
+            unchanged = after == before
+            operation(pb)
+            recovered = (_db_dump(pb.db),
+                         pb.book.get_orders_in_arrival_order()) == final
+            step_ok = (not raised or unchanged or not must_be_unchanged) and recovered
+
+        all_ok = all_ok and step_ok
+        pb.db.close()
+
+    return total, all_ok
+
+
+# ---------- backup, health check, recovery ----------
+
+def backup_database(source_path: str, dest_path: str) -> str:
+    """Make a consistent copy of a database, even while it is in use."""
+
+    if os.path.exists(dest_path):
+        raise FileExistsError(f"{dest_path} already exists")
+
+    source = sqlite3.connect(source_path)
+    target = sqlite3.connect(dest_path)
+
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
+    return dest_path
+
+
+def database_health(path: str) -> tuple[bool, str]:
+    """(healthy, message). Opening the file also lets SQLite finish any
+    recovery left over from a crash."""
+
+    if not os.path.exists(path):
+        return False, "file does not exist"
+
+    try:
+        conn = sqlite3.connect(path)
+
+        try:
+            verdict = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        return False, str(exc)
+
+    missing = {"orders", "trades", "events"} - tables
+
+    if missing:
+        return False, "missing tables: " + ", ".join(sorted(missing))
+
+    return verdict == "ok", verdict
+
+
+def recover_database(path: str, backup_path: str) -> dict:
+    """Replace a damaged database with a backup. The damaged file is kept
+    (renamed) so nothing is destroyed. Work done after the backup is lost."""
+
+    import shutil
+
+    healthy, message = database_health(path)
+
+    if healthy:
+        return {"action": "none", "message": "database is healthy"}
+
+    if not os.path.exists(backup_path):
+        raise FileNotFoundError(f"No backup at {backup_path}")
+
+    good, why = database_health(backup_path)
+
+    if not good:
+        raise ValueError(f"The backup is damaged too: {why}")
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    kept, n = f"{path}.corrupt-{stamp}", 0
+
+    while os.path.exists(kept):
+        n += 1
+        kept = f"{path}.corrupt-{stamp}-{n}"
+
+    if os.path.exists(path):
+        os.replace(path, kept)
+
+    for suffix in ("-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.replace(path + suffix, kept + suffix)
+
+    shutil.copy2(backup_path, path)
+
+    return {"action": "restored", "damaged_file_kept_as": kept,
+            "message": message}
+
+
+# ---------- real process crashes ----------
+
+def _crash_worker(path: str, n_orders: int, rounds: int, pause: float = 0.02) -> None:
+    """Runs the whole workload and can be killed at any moment. Every step is
+    safe to repeat, so a restarted worker just carries on where data ends."""
+
+    events = make_load_events(n_orders, seed=19)
+    size = -(-n_orders // rounds)
+    pb = PersistentBook.restore(OrderDatabase(path))
+
+    for k, start in enumerate(range(0, n_orders, size)):
+        chunk = events[start:start + size]
+
+        pb.submit_tolerant(chunk, quarantine=False)
+        print(f"PROGRESS {k} submitted", flush=True)
+        time.sleep(pause)
+
+        for i, event in enumerate(chunk):
+            if i % 10 == 5:
+                pb.cancel(event["order_id"])
+        print(f"PROGRESS {k} cancelled", flush=True)
+        time.sleep(pause)
+
+        pb.run_engine()
+        print(f"PROGRESS {k} matched", flush=True)
+        time.sleep(pause)
+
+    print("DONE", flush=True)
+
+
+def _txn_worker(path: str) -> None:
+    """Opens a transaction, writes rows, never commits, and waits to be killed."""
+
+    db = OrderDatabase(path)
+
+    for i in range(100):
+        db.conn.execute(
+            "INSERT INTO orders (order_id, side, price, quantity) "
+            "VALUES (?, 'B', 1.0, 1)", (f"TXN-{i}",)
+        )
+
+    print("READY", flush=True)
+    time.sleep(600)
+
+
+def _run_worker(path: str, n_orders: int, rounds: int, kill_after_lines=None,
+                kill_after_seconds=None, pause: float = 0.02,
+                timeout: float = 180) -> dict:
+    """Start a worker process and optionally kill it part-way through."""
+
+    import sys
+
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--crash-worker", path,
+         str(n_orders), str(rounds), str(pause)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    timers = [threading.Timer(timeout, proc.kill)]
+
+    if kill_after_seconds is not None:
+        timers.append(threading.Timer(kill_after_seconds, proc.kill))
+
+    for timer in timers:
+        timer.start()
+
+    seen, done, killed, tail = 0, False, False, []
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            tail = (tail + [line])[-5:]
+
+            if line == "DONE":
+                done = True
+            elif line.startswith("PROGRESS"):
+                seen += 1
+                if (kill_after_lines is not None and seen >= kill_after_lines
+                        and proc.poll() is None):
+                    proc.kill()
+                    killed = True
+                    break
+
+        proc.wait()
+    finally:
+        for timer in timers:
+            timer.cancel()
+        proc.stdout.close()
+
+    if not done and not killed and proc.returncode != 0:
+        killed = kill_after_seconds is not None
+
+    return {"killed": killed, "done": done, "returncode": proc.returncode,
+            "progress_lines": seen, "tail": tail}
+
+
+def kill_during_open_transaction(path: str) -> dict:
+    """Kill a process that has written rows but not committed them."""
+
+    import sys
+
+    db = OrderDatabase(path)
+    before = db.stats()["orders"]
+    db.close()
+
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--txn-worker", path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    watchdog = threading.Timer(60, proc.kill)
+    watchdog.start()
+    ready = False
+
+    try:
+        for line in proc.stdout:
+            if line.strip() == "READY":
+                ready = True
+                break
+
+        proc.kill()
+        proc.wait()
+    finally:
+        watchdog.cancel()
+        proc.stdout.close()
+
+    healthy, _ = database_health(path)
+    db = OrderDatabase(path)
+
+    try:
+        after = db.stats()["orders"]
+        leaked = db.conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE order_id LIKE 'TXN-%'"
+        ).fetchone()[0]
+        valid = validate_trade_persistence(db, expect_matched=False)["ok"]
+    finally:
+        db.close()
+
+    return {"ready": ready, "rows_before": before, "rows_after": after,
+            "uncommitted_rows_visible": leaked, "healthy": healthy,
+            "valid": valid}
+
+
+# ---------- the suite ----------
+
+def run_resilience_suite(n_orders: int = 3000, rounds: int = 6,
+                         crashes: int = 4, seed: int = 19) -> dict:
+    """Run every recovery scenario and compare against a trouble-free run."""
+
+    rng = random.Random(seed)
+    checks: dict[str, bool] = {}
+    fault_points: dict[str, int] = {}
+
+    events = make_load_events(n_orders, seed=19)
+    size = -(-n_orders // rounds)
+    chunks = [events[i:i + size] for i in range(0, n_orders, size)]
+
+    folder = tempfile.TemporaryDirectory()
+    path = os.path.join(folder.name, "crash.db")
+
+    try:
+        # A. the trouble-free reference run
+        control = PersistentBook(OrderDatabase())
+        for chunk in chunks:
+            _persistence_round(control, chunk)
+        expected = _persistence_snapshot(control)
+
+        # B. kill a real worker process again and again, checking after each
+        interrupted, valid_each_time = 0, True
+        total_lines = 3 * len(chunks)
+
+        for c in range(crashes):
+            if c % 2 == 0:
+                outcome = _run_worker(path, n_orders, rounds,
+                                      kill_after_lines=rng.randint(1, total_lines - 1))
+            else:
+                outcome = _run_worker(path, n_orders, rounds,
+                                      kill_after_seconds=rng.uniform(0.25, 0.9))
+
+            interrupted += 1 if outcome["killed"] else 0
+
+            if os.path.exists(path):
+                healthy, _ = database_health(path)
+                db = OrderDatabase(path)
+                try:
+                    valid = validate_trade_persistence(db, expect_matched=False)["ok"]
+                finally:
+                    db.close()
+                valid_each_time = valid_each_time and healthy and valid
+
+        finish = _run_worker(path, n_orders, rounds)
+
+        start = time.perf_counter()
+        restarted = PersistentBook.restore(OrderDatabase(path))
+        recovery_s = time.perf_counter() - start
+        start = time.perf_counter()
+        final_validation = validate_trade_persistence(restarted.db)
+        validate_s = time.perf_counter() - start
+        actual = _persistence_snapshot(restarted)
+        restarted.db.close()
+
+        checks["the worker really was killed part-way through"] = interrupted >= 1
+        checks["the database is valid after every crash"] = valid_each_time
+        checks["the restarted worker finishes the job"] = finish["done"]
+        checks["final trades equal a run with no crash"] = actual[0] == expected[0]
+        checks["final orders equal a run with no crash"] = actual[1] == expected[1]
+        checks["the restored book equals the book of a run with no crash"] = (
+            actual[2] == expected[2]
+        )
+        checks["the final data passes every persistence check"] = final_validation["ok"]
+
+        # C. a transaction that was never committed is discarded
+        txn = kill_during_open_transaction(path)
+        checks["rows from an uncommitted transaction vanish after a kill"] = (
+            txn["ready"] and txn["uncommitted_rows_visible"] == 0
+            and txn["rows_after"] == txn["rows_before"]
+            and txn["healthy"] and txn["valid"]
+        )
+
+        # D. a failure at every single statement leaves nothing half-done
+        def fresh(setup=()):
+            def make():
+                pb = PersistentBook(OrderDatabase())
+                if setup:
+                    pb.submit(list(setup))
+                return pb
+            return make
+
+        trade_setup = [
+            {"order_id": "B1", "side": BUY, "price": 101.0, "quantity": 10},
+            {"order_id": "S1", "side": SELL, "price": 100.0, "quantity": 4},
+            {"order_id": "S2", "side": SELL, "price": 101.0, "quantity": 8},
+        ]
+        t1 = Trade("T1", "B1", "S1", 100.5, 4)
+        t2 = Trade("T2", "B1", "S2", 101.0, 6)
+        bad_t = Trade("TX", "NOPE", "S1", 100.0, 1)
+        three = [{"order_id": f"N{i}", "side": BUY, "price": 50.0 + i, "quantity": 1}
+                 for i in range(3)]
+
+        def late_state():
+            pb = PersistentBook(OrderDatabase())
+            pb.run_engine(lambda b, f, n: [Trade("TL", "L1", "L2", 100.0, 5)],
+                          tolerant=True)
+            pb.submit([
+                {"order_id": "L1", "side": BUY, "price": 101.0, "quantity": 5},
+                {"order_id": "L2", "side": SELL, "price": 100.0, "quantity": 5},
+            ])
+            return pb
+
+        sweeps = {
+            "saving orders": (fresh(), lambda pb: pb.submit(three)),
+            "saving orders with quarantine": (
+                fresh(), lambda pb: pb.submit_tolerant(
+                    [three[0], None, three[1], {"order_id": "Z", "side": "B"}])),
+            "cancelling an order": (
+                fresh(three), lambda pb: pb.cancel("N1")),
+            "saving trades": (
+                fresh(trade_setup), lambda pb: pb.record_trades([t1, t2])),
+            "saving trades with quarantine": (
+                fresh(trade_setup),
+                lambda pb: pb.record_trades_tolerant([t1, bad_t, t2])),
+            "running the engine": (
+                fresh(trade_setup), lambda pb: pb.run_engine()),
+            "retrying quarantined trades": (
+                late_state, lambda pb: pb.retry_rejected()),
+        }
+
+        for label, (make, operation) in sweeps.items():
+            points, ok = fault_sweep(make, operation)
+            fault_points[label] = points
+            checks[f"a failure at any step of {label} leaves nothing half-done"] = ok
+
+        # E. a read-only database refuses writes and the book rolls back
+        path_ro = os.path.join(folder.name, "readonly.db")
+        PersistentBook(OrderDatabase(path_ro)).db.close()
+        ro = PersistentBook(OrderDatabase(path_ro, read_only=True))
+        try:
+            ro.submit(three)
+            refused = False
+        except sqlite3.OperationalError:
+            refused = True
+        checks["a read-only database refuses writes and the book rolls back"] = (
+            refused and len(ro.book) == 0
+        )
+        ro.db.close()
+
+        # F. the same events delivered again change nothing
+        replay = PersistentBook(OrderDatabase())
+        replay.submit_tolerant(chunks[0], quarantine=False)
+        once = (_db_dump(replay.db), replay.book.get_orders_in_arrival_order())
+        again = [replay.submit_tolerant(chunks[0], quarantine=False)["accepted"]
+                 for _ in range(3)]
+        checks["delivering the same events again changes nothing"] = (
+            again == [0, 0, 0]
+            and (_db_dump(replay.db), replay.book.get_orders_in_arrival_order()) == once
+        )
+        replay.db.close()
+
+        # G. a damaged file is replaced from a backup
+        good = PersistentBook(OrderDatabase(os.path.join(folder.name, "live.db")))
+        for chunk in chunks[:2]:
+            _persistence_round(good, chunk)
+        saved_state = _persistence_snapshot(good)
+        good.db.close()
+        live_path = os.path.join(folder.name, "live.db")
+        backup_path = backup_database(live_path, os.path.join(folder.name, "backup.db"))
+
+        with open(live_path, "r+b") as handle:          # overwrite the file header
+            handle.write(b"\x00garbage-garbage-garbage\x00" * 8)
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(live_path + suffix):
+                os.remove(live_path + suffix)
+
+        damaged_seen = not database_health(live_path)[0]
+        recovery = recover_database(live_path, backup_path)
+        back = PersistentBook.restore(OrderDatabase(live_path))
+        same = _persistence_snapshot(back) == saved_state
+        valid_back = validate_trade_persistence(back.db)["ok"]
+        back.db.close()
+        checks["a damaged database file is detected"] = damaged_seen
+        checks["recovery restores the backup and keeps the damaged file"] = (
+            recovery["action"] == "restored"
+            and os.path.exists(recovery["damaged_file_kept_as"])
+            and same and valid_back
+        )
+
+        return {
+            "orders": n_orders, "rounds": len(chunks), "crashes": crashes,
+            "interrupted": interrupted, "trades": len(expected[0]),
+            "recovery_s": recovery_s, "validate_s": validate_s,
+            "fault_points": fault_points,
+            "checks": checks, "ok": all(checks.values()),
+        }
+    finally:
+        folder.cleanup()
+
+
+def format_resilience_report(r: dict) -> str:
+    lines = [
+        f"RECOVERY AND RESILIENCY: {r['orders']:,} orders in {r['rounds']} rounds; "
+        f"{r['interrupted']} of {r['crashes']} worker runs killed part-way; "
+        f"{r['trades']:,} trades",
+        f"  restart and rebuild the book  {r['recovery_s']:.3f} s",
+        f"  full validation               {r['validate_s']:.3f} s",
+        "  failure points tested: " + ", ".join(
+            f"{label} {points}" for label, points in r["fault_points"].items()),
+        "  checks:",
+    ]
+    lines += [f"    {'ok  ' if ok else 'FAIL'} {name}"
+              for name, ok in r["checks"].items()]
+    lines.append("  RESULT: " + ("ALL CHECKS PASSED" if r["ok"] else "FAILED"))
+    return "\n".join(lines)
+
+
+# ============================================================
+# BENCHMARK REPORT (DAYS 11-19)
 # ============================================================
 
 def _report_load_table(runs: list[dict]) -> str:
@@ -1959,6 +3228,9 @@ _DAY_LOG = [
          "connected to the matching engine"),
     (17, "Trade persistence validation: rule replay, restart invariance, "
          "tamper detection"),
+    (18, "Missing and failed records: quarantine, rollback, retry, reconcile"),
+    (19, "Recovery and resiliency testing: killed processes, injected "
+         "failures, backups"),
 ]
 
 
@@ -2054,7 +3326,7 @@ def _tests_summary_line(tests) -> str:
 def _total_tests_section(tests) -> list[str]:
     """Total test count, per file, with what Day 16 added."""
 
-    lines = ["", "### Total tests (including Days 16 and 17)", ""]
+    lines = ["", "### Total tests (including Days 16 to 19)", ""]
 
     if tests is None:
         return lines + ["Not run. Run without --skip-tests to include them.", ""]
@@ -2062,6 +3334,8 @@ def _total_tests_section(tests) -> list[str]:
     by_file = tests["by_file"]
     day16 = sum(n for name, n in by_file.items() if _test_day(name) == "16")
     day17 = sum(n for name, n in by_file.items() if _test_day(name) == "17")
+    day18 = sum(n for name, n in by_file.items() if _test_day(name) == "18")
+    day19 = sum(n for name, n in by_file.items() if _test_day(name) == "19")
 
     def day_key(item):
         day = _test_day(item[0])
@@ -2071,8 +3345,9 @@ def _total_tests_section(tests) -> list[str]:
     lines += [f"**{tests['ran']} tests in total, "
               f"{'all passing' if tests['ok'] else 'SOME FAILING'}** "
               f"(ran in {tests['seconds']:.1f} s). "
-              f"Day 16 added {day16} tests and Day 17 added {day17}; before "
-              f"Day 16 the total was {tests['ran'] - day16 - day17}.",
+              f"Day 16 added {day16} tests, Day 17 added {day17}, Day 18 "
+              f"added {day18} and Day 19 added {day19}; before Day 16 the "
+              f"total was {tests['ran'] - day16 - day17 - day18 - day19}.",
               "",
               "| Test file | Day | Tests |", "|---|---|---:|"]
 
@@ -2090,7 +3365,7 @@ def _total_tests_section(tests) -> list[str]:
 
 
 def _day15_section(runs: list[dict], zc: dict, ipc_text, tests,
-                   db_run: dict, pv: dict) -> list[str]:
+                   db_run: dict, pv: dict, fh: dict, rs: dict) -> list[str]:
     big = runs[-1]
     by_name = {c["check"]: c["passed"] for c in zc["checks"]}
 
@@ -2116,14 +3391,18 @@ def _day15_section(runs: list[dict], zc: dict, ipc_text, tests,
          db_run["ok"]),
         ("Stored trades validated; restarts change nothing (Day 17)",
          pv["ok"]),
+        ("Missing and failed records are quarantined, rolled back or "
+         "repaired (Day 18)", fh["ok"]),
+        ("Data survives killed processes, injected failures and a damaged "
+         "file (Day 19)", rs["ok"]),
     ]
     if tests is not None:
         checklist.append(
             (f"Full test suite passes ({tests['ran']} tests)", tests["ok"])
         )
 
-    lines = ["", "## Days 15 to 17: Final summary", "",
-             "### Work completed, Days 1 to 17", "",
+    lines = ["", "## Days 15 to 19: Final summary", "",
+             "### Work completed, Days 1 to 19", "",
              "| Day | Work |", "|---|---|"]
     lines += [f"| {d} | {text} |" for d, text in _DAY_LOG]
 
@@ -2180,6 +3459,8 @@ def build_benchmark_report(
     zc = verify_zero_copy()
     db_run = run_database_demo(sizes[0])
     pv = run_persistence_validation(sizes[0])
+    fh = run_failure_handling_demo(20_000)
+    rs = run_resilience_suite(3000, rounds=6, crashes=4)
 
     ipc_text = None
     if include_ipc and os.path.exists("ipc_benchmark.py"):
@@ -2196,13 +3477,13 @@ def build_benchmark_report(
 
     tests = run_test_suite() if include_tests else None
 
-    all_ok = (all(r["ok"] for r in runs) and zc["ok"] and db_run["ok"] and pv["ok"]
+    all_ok = (all(r["ok"] for r in runs) and zc["ok"] and db_run["ok"] and pv["ok"] and fh["ok"] and rs["ok"]
               and (tests is None or tests["ok"]))
 
     lines = [
-        "# ChronosMatch Benchmark Report (Day 17)",
+        "# ChronosMatch Benchmark Report (Day 19)",
         "",
-        f"Teammate 3 - Days 1 to 17 - {time.strftime('%Y-%m-%d %H:%M')}",
+        f"Teammate 3 - Days 1 to 19 - {time.strftime('%Y-%m-%d %H:%M')}",
         "",
         f"Machine: {platform.system()} {platform.release()}, "
         f"{os.cpu_count()} logical CPUs, Python {platform.python_version()} "
@@ -2275,6 +3556,41 @@ def build_benchmark_report(
               for name, ok in pv["checks"].items()]
     lines += [f"- Problem found: {p}" for p in pv["problems"]]
 
+    lines += [
+        "", "## Day 18: Missing and failed records", "",
+        f"{fh['orders']:,} order events were sent with {fh['bad_events']:,} "
+        "deliberately damaged, plus bad trades, a failing database write, a "
+        "locked database and a book that disagreed with the database. "
+        f"{fh['quarantined_ever']:,} records were quarantined in total and "
+        f"{fh['quarantined']:,} are still waiting after retries.",
+        "",
+    ]
+    lines += [f"- {'PASS' if ok else 'FAIL'}: {name}"
+              for name, ok in fh["checks"].items()]
+
+    lines += [
+        "", "## Day 19: Recovery and resiliency testing", "",
+        f"{rs['orders']:,} orders were processed in {rs['rounds']} rounds while "
+        f"a real worker process was killed part-way through "
+        f"({rs['interrupted']} of {rs['crashes']} runs interrupted). After "
+        "each crash the database was checked, and after the last one the work "
+        f"was finished and compared with a run that never crashed "
+        f"({rs['trades']:,} trades).",
+        "",
+        f"Restart and rebuild of the book: {rs['recovery_s']:.3f} s. Full "
+        f"validation: {rs['validate_s']:.3f} s.",
+        "",
+        "Failure points tested (one injected disk error per database "
+        "statement): " + ", ".join(
+            f"{label} ({points})" for label, points in rs["fault_points"].items())
+        + ".",
+        "",
+    ]
+    lines += [f"- {'PASS' if ok else 'FAIL'}: {name}"
+              for name, ok in rs["checks"].items()]
+    lines += ["", "Limit: restoring from a backup loses any work done after the "
+              "backup was taken.", ""]
+
     lines += _total_tests_section(tests)
 
     lines += ["", "## Day 11: IPC methods compared", ""]
@@ -2286,7 +3602,7 @@ def build_benchmark_report(
 
     lines += ["", "## Findings", ""]
     lines += [f"- {text}" for text in _report_findings(runs, zc)]
-    lines += _day15_section(runs, zc, ipc_text, tests, db_run, pv)
+    lines += _day15_section(runs, zc, ipc_text, tests, db_run, pv, fh, rs)
     lines += [
         "",
         "## What this means",
@@ -2341,6 +3657,64 @@ if __name__ == "__main__":
             handle.write(text)
         print("saved benchmark_report.md")
         sys.exit(0 if ok else 1)
+
+    if "--count-tests" in sys.argv:
+        counts, broken = count_tests_by_file()
+
+        def sort_key(item):
+            digits = "".join(c for c in _test_day(item[0]).split("-")[0] if c.isdigit())
+            return (int(digits) if digits else 999, item[0])
+
+        print(f"{'test file':<34} {'day':<6} tests")
+        print("-" * 48)
+        for name, count in sorted(counts.items(), key=sort_key):
+            print(f"{name:<34} {_test_day(name):<6} {count:>5}")
+        print("-" * 48)
+        print(f"{'TOTAL':<34} {'':<6} {sum(counts.values()):>5}")
+        for name in sorted(set(broken)):
+            print(f"CANNOT IMPORT (not counted): {name}")
+        sys.exit(1 if broken else 0)
+
+    if "--crash-worker" in sys.argv:
+        i = sys.argv.index("--crash-worker")
+        _crash_worker(sys.argv[i + 1], int(sys.argv[i + 2]), int(sys.argv[i + 3]),
+                      float(sys.argv[i + 4]) if len(sys.argv) > i + 4 else 0.02)
+        sys.exit(0)
+
+    if "--txn-worker" in sys.argv:
+        _txn_worker(sys.argv[sys.argv.index("--txn-worker") + 1])
+        sys.exit(0)
+
+    if "--resilience" in sys.argv:
+        n = 3000
+        if "--orders" in sys.argv:
+            n = int(sys.argv[sys.argv.index("--orders") + 1].replace(",", ""))
+        crashes = 4
+        if "--crashes" in sys.argv:
+            crashes = int(sys.argv[sys.argv.index("--crashes") + 1])
+        report = run_resilience_suite(n, crashes=crashes)
+        print(format_resilience_report(report))
+        sys.exit(0 if report["ok"] else 1)
+
+    if "--failures" in sys.argv:
+        n = 20_000
+        if "--orders" in sys.argv:
+            n = int(sys.argv[sys.argv.index("--orders") + 1].replace(",", ""))
+        report = run_failure_handling_demo(n)
+        print(format_failure_report(report))
+        sys.exit(0 if report["ok"] else 1)
+
+    if "--validate-db" in sys.argv:
+        file_path = sys.argv[sys.argv.index("--validate-db") + 1]
+        try:
+            report = validate_database_file(
+                file_path, expect_matched="--unmatched" not in sys.argv
+            )
+        except (FileNotFoundError, sqlite3.Error) as exc:
+            print(f"Cannot check {file_path}: {exc}")
+            sys.exit(2)
+        print(format_validation_report(report))
+        sys.exit(0 if report["ok"] else 1)
 
     if "--persistence" in sys.argv:
         n = 50_000
