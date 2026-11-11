@@ -1,1 +1,7 @@
 __pycache__/
+*.db
+*.db-wal
+*.db-shm
+*.db.corrupt-*
+log_export_*/
+*.partial/
