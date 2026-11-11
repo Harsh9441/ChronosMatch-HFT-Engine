@@ -1,108 +1,76 @@
+"""Day 20: end-to-end validation."""
 
+import os
+import tempfile
 import unittest
 
-from orderbook import (
-    run_end_to_end_validation,
-    format_end_to_end_report
-)
+import orderbook as ob
 
 
-class TestDay20EndToEnd(unittest.TestCase):
+def failed(result):
+    return [name for name, ok in result["checks"].items() if not ok]
 
-    def test_complete_validation_returns_result(self):
-        result = run_end_to_end_validation(
-            orders=100,
-            crashes=1,
-            include_tests=False
-        )
 
-        self.assertIsInstance(result, dict)
-        self.assertIn("ok", result)
-        self.assertIn("checks", result)
-        self.assertIn("details", result)
+class TestEndToEnd(unittest.TestCase):
+    def test_default_run(self):
+        r = ob.run_end_to_end_validation(3000, batch=500)
+        self.assertEqual(failed(r), [])
+        self.assertEqual(r["batches"], 6)
+        self.assertEqual(r["nacks"], 1)                # every 4th batch is damaged once
+        self.assertEqual(r["duplicates"], 1)
+        self.assertGreater(r["trades"], 0)
 
-    def test_all_pipeline_stages_are_checked(self):
-        result = run_end_to_end_validation(
-            orders=100,
-            crashes=1,
-            include_tests=False
-        )
+    def test_no_damage(self):
+        r = ob.run_end_to_end_validation(2000, batch=500, corrupt_every=0)
+        self.assertEqual(failed(r), [])
+        self.assertEqual(r["nacks"], 0)
 
-        expected = [
-            "Order book and load validation",
-            "IPC validation",
-            "Zero-copy validation",
-            "Database validation",
-            "Persistence validation",
-            "Failure handling validation",
-            "Recovery and resilience validation"
-        ]
+    def test_every_batch_damaged_once(self):
+        r = ob.run_end_to_end_validation(2000, batch=500, corrupt_every=1)
+        self.assertEqual(failed(r), [])
+        self.assertEqual(r["nacks"], r["batches"])
 
-        for name in expected:
-            with self.subTest(stage=name):
-                self.assertIn(name, result["checks"])
+    def test_no_duplicate_delivery(self):
+        r = ob.run_end_to_end_validation(2000, batch=500, duplicate_seq=-1)
+        self.assertEqual(failed(r), [])
+        self.assertEqual(r["duplicates"], 0)
 
-    def test_final_status_matches_checks(self):
-        result = run_end_to_end_validation(
-            orders=100,
-            crashes=1,
-            include_tests=False
-        )
+    def test_one_batch_only(self):
+        r = ob.run_end_to_end_validation(500, batch=500)
+        self.assertEqual(failed(r), [])
+        self.assertEqual(r["batches"], 1)
 
-        expected = (
-            all(result["checks"].values())
-            and bool(result["checks"])
-        )
+    def test_last_batch_is_smaller(self):
+        r = ob.run_end_to_end_validation(2750, batch=1000)
+        self.assertEqual(failed(r), [])
+        self.assertEqual(r["batches"], 3)
 
-        self.assertEqual(result["ok"], expected)
+    def test_export_folder_is_kept_and_verifies(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "kept")
+            r = ob.run_end_to_end_validation(2000, batch=500, export_dir=out)
+            self.assertEqual(failed(r), [])
+            self.assertTrue(os.path.exists(os.path.join(out, "manifest.json")))
+            self.assertTrue(ob.verify_export(out)["ok"])
+            self.assertEqual(r["export"]["dir"], out)
 
-    def test_report_contains_all_results(self):
-        result = run_end_to_end_validation(
-            orders=100,
-            crashes=1,
-            include_tests=False
-        )
-
-        report = format_end_to_end_report(result)
-
-        self.assertIn("CHRONOSMATCH", report)
-        self.assertIn("DAY 20", report)
-        self.assertIn("FINAL STATUS", report)
-
-    def test_report_shows_failed_validation(self):
-        report = {
-            "ok": False,
-            "orders": 100,
-            "crashes": 1,
-            "checks": {
-                "Database validation": True,
-                "Recovery and resilience validation": False
-            },
-            "details": {
-                "Recovery and resilience validation": "Recovery failed"
-            }
-        }
-
-        output = format_end_to_end_report(report)
-
-        self.assertIn("FAIL", output)
-        self.assertIn("Recovery and resilience validation", output)
-
-    def test_invalid_order_count(self):
+    def test_bad_arguments(self):
         with self.assertRaises(ValueError):
-            run_end_to_end_validation(
-                orders=0,
-                crashes=1,
-                include_tests=False
-            )
-
-    def test_negative_crash_count(self):
+            ob.run_end_to_end_validation(0)
         with self.assertRaises(ValueError):
-            run_end_to_end_validation(
-                orders=100,
-                crashes=-1,
-                include_tests=False
-            )
+            ob.run_end_to_end_validation(100, batch=0)
+
+    def test_report_text(self):
+        r = ob.run_end_to_end_validation(1000, batch=500)
+        text = ob.format_end_to_end_report(r)
+        self.assertIn("ALL CHECKS PASSED", text)
+        self.assertIn("separate producer process", text)
+
+    def test_20000_orders(self):
+        r = ob.run_end_to_end_validation(20_000)
+        print("\n" + ob.format_end_to_end_report(r))
+        self.assertEqual(failed(r), [])
+        self.assertEqual(r["batches"], 20)
 
 
 if __name__ == "__main__":

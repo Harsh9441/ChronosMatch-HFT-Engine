@@ -1,6 +1,6 @@
 """
 ChronosMatch - Order Book (Teammate 3)
-Combined Day 1-19 implementation.
+Combined Day 1-21 implementation.
 
 Day 1: Basic order-book structure.
 Day 2: Insert buy/sell orders with validation.
@@ -23,12 +23,17 @@ Day 17: Trade persistence validation: python orderbook.py --persistence
 Day 18: Missing and failed records (quarantine, retry, reconcile):
         python orderbook.py --failures
 Day 19: Recovery and resiliency testing: python orderbook.py --resilience
+Day 20: Export logs for reporting: python orderbook.py --export-logs DB FOLDER
+Day 21: End-to-end validation: python orderbook.py --end-to-end
 Check an existing database file: python orderbook.py --validate-db FILE
 Test count per file (no run): python orderbook.py --count-tests
 
 This is a storage/order-book module, not a full matching engine.
 """
 
+import csv
+import datetime
+import hashlib
 import heapq
 import json
 import math
@@ -2657,12 +2662,14 @@ def _db_dump(db: "OrderDatabase") -> tuple:
     )
 
 
-def fault_sweep(make_state, operation, must_be_unchanged: bool = True):
+def fault_sweep(make_state, operation):
     """Run operation(pb) once per database statement, failing that statement.
 
-    After each failure the data must be unchanged (or, when part of the work
-    had already been committed, repairable), and running the operation again
-    must reach exactly the same final state as a run with no failure.
+    After every failure the data must be all-or-nothing: exactly as it was
+    before, or exactly the finished result (a failure in a read that comes
+    after the commit can still raise). If only the book cleanup was cut short,
+    the book must be repairable. Running the operation again must always end
+    in the same final state as a run with no failure.
     Returns (statements_tested, all_ok).
     """
 
@@ -2684,23 +2691,29 @@ def fault_sweep(make_state, operation, must_be_unchanged: bool = True):
 
         try:
             operation(pb)
-            raised = False
         except sqlite3.OperationalError:
-            raised = True
+            pass
 
         pb.db.conn = pb.db.conn._conn
-        after = (_db_dump(pb.db), pb.book.get_orders_in_arrival_order())
 
         if pb.needs_reconcile:
             # The work was committed; only the book cleanup was cut short.
             pb.reconcile(repair=True)
-            step_ok = (_db_dump(pb.db), pb.book.get_orders_in_arrival_order()) == final
+            step_ok = (_db_dump(pb.db),
+                       pb.book.get_orders_in_arrival_order()) == final
         else:
-            unchanged = after == before
-            operation(pb)
+            after = (_db_dump(pb.db), pb.book.get_orders_in_arrival_order())
+            all_or_nothing = after == before or after == final
+
+            if after != final:
+                try:
+                    operation(pb)
+                except Exception:                       # noqa: BLE001
+                    pass                                # not recoverable: the check below fails
+
             recovered = (_db_dump(pb.db),
                          pb.book.get_orders_in_arrival_order()) == final
-            step_ok = (not raised or unchanged or not must_be_unchanged) and recovered
+            step_ok = all_or_nothing and recovered
 
         all_ok = all_ok and step_ok
         pb.db.close()
@@ -3147,7 +3160,472 @@ def format_resilience_report(r: dict) -> str:
 
 
 # ============================================================
-# BENCHMARK REPORT (DAYS 11-19)
+# DAY 20: EXPORT LOGS FOR REPORTING
+# ============================================================
+
+# Writes the audit log, orders, trades and quarantined records to CSV and/or
+# JSON Lines files, plus a summary and a manifest with a SHA-256 for every
+# file. Everything is read in ONE snapshot, so the files agree with each
+# other, and the export is built in a temporary folder so a failure never
+# leaves half an export behind. The database is only read.
+
+_EXPORT_TABLES = {
+    "orders": (
+        "SELECT seq, order_id, side, price, quantity, filled, status "
+        "FROM orders ORDER BY seq",
+        ("seq", "order_id", "side", "price", "quantity", "filled", "status")),
+    "trades": (
+        "SELECT seq, trade_id, buy_order_id, sell_order_id, price, quantity "
+        "FROM trades ORDER BY seq",
+        ("seq", "trade_id", "buy_order_id", "sell_order_id", "price",
+         "quantity")),
+    "events": (
+        "SELECT e.seq, e.kind, e.ref, o.side, "
+        "COALESCE(o.price, t.price), COALESCE(o.quantity, t.quantity), "
+        "t.buy_order_id, t.sell_order_id FROM events e "
+        "LEFT JOIN orders o ON e.kind IN ('order', 'cancel') AND o.order_id = e.ref "
+        "LEFT JOIN trades t ON e.kind = 'trade' AND t.trade_id = e.ref "
+        "ORDER BY e.seq",
+        ("seq", "kind", "ref", "side", "price", "quantity", "buy_order_id",
+         "sell_order_id")),
+    "rejected": (
+        "SELECT id, kind, ref, reason, payload, resolved FROM rejected "
+        "ORDER BY id",
+        ("id", "kind", "ref", "reason", "payload", "resolved")),
+}
+
+_EXPORT_EXT = {"csv": ".csv", "jsonl": ".jsonl"}
+
+
+def _safe_cell(value):
+    """Stop a spreadsheet from running text that starts like a formula."""
+
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+
+    return value
+
+
+def _write_export(cursor, columns, path: str, fmt: str, safe: bool) -> int:
+    rows = 0
+
+    if fmt == "csv":
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(columns)
+            for row in cursor:
+                writer.writerow([_safe_cell(v) if safe else v for v in row])
+                rows += 1
+    else:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            for row in cursor:
+                handle.write(json.dumps(dict(zip(columns, row)),
+                                        ensure_ascii=False) + "\n")
+                rows += 1
+
+    return rows
+
+
+def _sha256_of(path: str) -> str:
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+
+    return digest.hexdigest()
+
+
+def export_logs(source, out_dir: str, formats=("csv",), overwrite: bool = False,
+                spreadsheet_safe: bool = True, validate: bool = True) -> dict:
+    """Export the database's logs for reporting.
+
+    source is a database file path (opened read-only) or an OrderDatabase.
+    Files written: orders, trades, events (the audit log with the order or
+    trade details joined in) and rejected, in each requested format, plus
+    summary.json and manifest.json. With spreadsheet_safe=True, text that
+    starts with = + - @ gets a leading apostrophe in CSV files so Excel cannot
+    treat it as a formula; JSON Lines files always hold the raw values.
+    Note: the log records the ORDER of events (seq) but not clock times.
+    """
+
+    import shutil
+
+    formats = tuple(formats)
+    unknown = set(formats) - set(_EXPORT_EXT)
+
+    if not formats or unknown:
+        raise ValueError(f"formats must be from {sorted(_EXPORT_EXT)}")
+
+    targets = [f"{name}{_EXPORT_EXT[f]}" for name in _EXPORT_TABLES for f in formats]
+    targets += ["summary.json", "manifest.json"]
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not overwrite:
+        existing = [t for t in targets if os.path.exists(os.path.join(out_dir, t))]
+        if existing:
+            raise FileExistsError(
+                "Export files already exist: " + ", ".join(existing)
+                + " (use overwrite=True or a new folder)"
+            )
+
+    opened_here = isinstance(source, str)
+    if opened_here:
+        try:
+            db = OrderDatabase(source, read_only=True)
+        except sqlite3.OperationalError:
+            db = OrderDatabase(source)           # e.g. a log left by a crash
+    else:
+        db = source
+
+    tmp = tempfile.mkdtemp(prefix=".export-", dir=out_dir)
+
+    try:
+        conn = _raw(db)
+        conn.execute("BEGIN")                    # one consistent snapshot
+        try:
+            rows = {}
+            for name, (sql, columns) in _EXPORT_TABLES.items():
+                for fmt in formats:
+                    fname = f"{name}{_EXPORT_EXT[fmt]}"
+                    rows[fname] = _write_export(
+                        conn.execute(sql), columns, os.path.join(tmp, fname),
+                        fmt, spreadsheet_safe)
+
+            stats = db.stats()
+            unresolved = db.count_rejected()
+            validation = (validate_trade_persistence(db, expect_matched=False)
+                          if validate else None)
+        finally:
+            conn.rollback()
+
+        summary = {
+            "exported_at_utc": datetime.datetime.now(
+                datetime.timezone.utc).isoformat(timespec="seconds"),
+            "source": getattr(db, "path", str(source)),
+            "python": platform.python_version(),
+            "formats": list(formats),
+            "spreadsheet_safe_csv": bool(spreadsheet_safe),
+            "stats": stats,
+            "unresolved_rejected": unresolved,
+            "validation": (None if validation is None else {
+                "ok": validation["ok"], "checks": validation["checks"],
+                "problems": validation["problems"]}),
+            "note": "events are ordered by seq; no clock times are stored",
+        }
+        with open(os.path.join(tmp, "summary.json"), "w", encoding="utf-8") as h:
+            json.dump(summary, h, indent=2)
+
+        files = {}
+        for fname in list(rows) + ["summary.json"]:
+            path = os.path.join(tmp, fname)
+            files[fname] = {"rows": rows.get(fname), "bytes": os.path.getsize(path),
+                            "sha256": _sha256_of(path)}
+        with open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8") as h:
+            json.dump({"files": files}, h, indent=2)
+
+        for fname in os.listdir(tmp):
+            os.replace(os.path.join(tmp, fname), os.path.join(out_dir, fname))
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if opened_here:
+            db.close()
+
+    return {"out_dir": out_dir, "files": files, "stats": stats,
+            "unresolved_rejected": unresolved,
+            "validation_ok": None if validation is None else validation["ok"]}
+
+
+def verify_export(out_dir: str, source=None) -> dict:
+    """Check an export against its manifest and, optionally, the database."""
+
+    problems: list[str] = []
+    manifest_path = os.path.join(out_dir, "manifest.json")
+
+    if not os.path.exists(manifest_path):
+        return {"ok": False, "problems": ["manifest.json is missing"], "files": 0}
+
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)["files"]
+
+    counted: dict[str, int] = {}
+
+    for fname, info in manifest.items():
+        path = os.path.join(out_dir, fname)
+
+        if not os.path.exists(path):
+            problems.append(f"{fname}: file is missing")
+            continue
+
+        if os.path.getsize(path) != info["bytes"] or _sha256_of(path) != info["sha256"]:
+            problems.append(f"{fname}: contents changed since the export")
+            continue
+
+        if info["rows"] is not None:
+            if fname.endswith(".csv"):
+                with open(path, newline="", encoding="utf-8") as handle:
+                    n = sum(1 for _ in csv.reader(handle)) - 1
+            else:
+                with open(path, encoding="utf-8") as handle:
+                    n = sum(1 for line in handle if line.strip())
+
+            if n != info["rows"]:
+                problems.append(f"{fname}: {n} rows but the manifest says {info['rows']}")
+
+            counted[fname.split(".")[0]] = n
+
+    if source is not None:
+        opened_here = isinstance(source, str)
+        db = OrderDatabase(source, read_only=True) if opened_here else source
+        try:
+            for table in _EXPORT_TABLES:
+                have = db.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                if table in counted and counted[table] != have:
+                    problems.append(
+                        f"{table}: export has {counted[table]} rows, database has {have}")
+        finally:
+            if opened_here:
+                db.close()
+
+    return {"ok": not problems, "problems": problems, "files": len(manifest)}
+
+
+def format_export_report(result: dict, check: dict) -> str:
+    lines = [f"LOG EXPORT: {result['out_dir']}",
+             f"  {'file':<18} {'rows':>9} {'bytes':>10}  sha256"]
+
+    for fname, info in result["files"].items():
+        rows = "" if info["rows"] is None else f"{info['rows']:,}"
+        lines.append(f"  {fname:<18} {rows:>9} {info['bytes']:>10,}  {info['sha256'][:16]}")
+
+    healthy = {True: "healthy", False: "PROBLEMS FOUND", None: "not checked"}[
+        result["validation_ok"]]
+    lines += [f"  data in the database: {healthy}",
+              f"  files match their manifest and the database: "
+              f"{'yes' if check['ok'] else 'NO'}"]
+    lines += [f"    problem: {p}" for p in check["problems"]]
+    return "\n".join(lines)
+
+
+# ============================================================
+# DAY 21: END-TO-END VALIDATION
+# ============================================================
+
+# The whole path in one run: a producer PROCESS encodes order batches, some
+# are damaged in transit, the consumer refuses them and the producer re-sends,
+# one batch is delivered twice, the orders go into the book and the database,
+# matching runs after every batch, the database is closed and reopened in the
+# middle, and the logs are exported and verified at the end. The result is
+# compared with a direct in-memory run that had none of that trouble.
+
+def _e2e_producer(conn, n_orders: int, batch: int, corrupt_every: int,
+                  duplicate_seq: int) -> None:
+    """Producer process: encode batches, send them, obey ACK/NACK."""
+
+    events = make_load_events(n_orders, seed=21)
+    chunks = [events[i:i + batch] for i in range(0, n_orders, batch)]
+
+    def send(seq: int, payload: bytes) -> None:
+        conn.send_bytes(seq.to_bytes(4, "big") + payload)
+
+    for seq, chunk in enumerate(chunks):
+        clean = encode_events(chunk)
+        damaged = bool(corrupt_every) and seq % corrupt_every == corrupt_every - 1
+
+        send(seq, clean[:-3] if damaged else clean)
+
+        if conn.recv_bytes() == b"NACK":
+            send(seq, clean)                       # re-send the good copy
+            conn.recv_bytes()
+
+        if seq == duplicate_seq:
+            send(seq, clean)                       # delivered a second time
+            conn.recv_bytes()
+
+    conn.send_bytes(b"END")
+    conn.close()
+
+
+def run_end_to_end_validation(n_orders: int = 20_000, batch: int = 1000,
+                              corrupt_every: int = 4, duplicate_seq: int = 1,
+                              export_dir: str | None = None) -> dict:
+    """Run the whole pipeline and compare it with a direct in-memory run."""
+
+    import multiprocessing as mp
+
+    if n_orders < 1 or batch < 1:
+        raise ValueError("n_orders and batch must be at least 1")
+
+    events = make_load_events(n_orders, seed=21)
+    chunks = [events[i:i + batch] for i in range(0, n_orders, batch)]
+    expected_nacks = sum(1 for s in range(len(chunks))
+                         if corrupt_every and s % corrupt_every == corrupt_every - 1)
+
+    control = PersistentBook(OrderDatabase())            # direct run, no trouble
+    for chunk in chunks:
+        _persistence_round(control, chunk)
+    expected = _persistence_snapshot(control)
+    control.db.close()
+
+    folder = tempfile.TemporaryDirectory()
+    path = os.path.join(folder.name, "e2e.db")
+    export_path = export_dir or os.path.join(folder.name, "export")
+    pb = PersistentBook(OrderDatabase(path))
+
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe(duplex=True)
+    proc = ctx.Process(target=_e2e_producer,
+                       args=(child, n_orders, batch, corrupt_every, duplicate_seq))
+
+    done: set[int] = set()
+    quarantined: dict[int, int] = {}
+    nacks = duplicates = restarts = 0
+    failure = None
+    restart_at = max(1, len(chunks) // 2)
+    result: dict = {}
+
+    try:
+        proc.start()
+        child.close()
+        start = time.perf_counter()
+
+        while True:
+            try:
+                if not parent.poll(120):
+                    raise TimeoutError("the producer stopped sending")
+                message = parent.recv_bytes()
+            except (EOFError, TimeoutError, OSError) as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+                break
+
+            if message == b"END":
+                break
+
+            seq, payload = int.from_bytes(message[:4], "big"), message[4:]
+
+            if seq in done:
+                duplicates += 1                          # already stored: just ACK
+                parent.send_bytes(b"ACK")
+                continue
+
+            try:
+                batch_events = decode_events(payload)
+            except ValueError as exc:
+                nacks += 1
+                pb.db.save_rejected([("order", f"batch {seq}",
+                                      f"damaged in transit: {exc}",
+                                      payload[:64].hex())])
+                quarantined[seq] = pb.db.conn.execute(
+                    "SELECT MAX(id) FROM rejected").fetchone()[0]
+                parent.send_bytes(b"NACK")
+                continue
+
+            pb.submit(batch_events)
+            for i, event in enumerate(batch_events):
+                if i % 10 == 5:
+                    pb.cancel(event["order_id"])
+            pb.run_engine()
+            done.add(seq)
+
+            if seq in quarantined:
+                pb.db.resolve_rejected([quarantined.pop(seq)])
+
+            parent.send_bytes(b"ACK")
+
+            if len(done) == restart_at:                  # close and reopen mid-run
+                pb.db.close()
+                pb = PersistentBook.restore(OrderDatabase(path))
+                restarts += 1
+
+        elapsed = max(time.perf_counter() - start, 1e-9)
+        proc.join(30)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+
+        actual = _persistence_snapshot(pb)
+        validation = validate_trade_persistence(pb.db)
+        reconciled = pb.reconcile()["consistent_before"]
+        live_book = pb.book.get_orders_in_arrival_order()
+        rejected_total = pb.db.count_rejected(unresolved_only=False)
+        unresolved = pb.db.count_rejected()
+
+        pb.db.close()
+        again = PersistentBook.restore(OrderDatabase(path))
+        restarts += 1
+        restored_equal = again.book.get_orders_in_arrival_order() == live_book
+
+        exported = export_logs(again.db, export_path, formats=("csv", "jsonl"))
+        verified = verify_export(export_path, again.db)
+        with open(os.path.join(export_path, "summary.json"), encoding="utf-8") as h:
+            summary = json.load(h)
+        again.db.close()
+
+        checks = {
+            "every batch arrived exactly once": done == set(range(len(chunks))),
+            "damaged batches were refused and re-sent": nacks == expected_nacks,
+            "a duplicate delivery was recognised and ignored":
+                duplicates == (1 if 0 <= duplicate_seq < len(chunks) else 0),
+            "damaged batches were quarantined, then resolved after the re-send":
+                rejected_total == nacks and unresolved == 0,
+            "the producer process exited cleanly":
+                failure is None and proc.exitcode == 0,
+            "final trades equal the direct in-memory run": actual[0] == expected[0],
+            "final orders and fills equal the direct run": actual[1] == expected[1],
+            "the final book equals the direct run": actual[2] == expected[2],
+            "stored data passes every persistence check": validation["ok"],
+            "the book and the database agree": reconciled,
+            "the book restored after a restart equals the live book": restored_equal,
+            "exported files match their manifest and the database": verified["ok"],
+            "the export summary reports healthy data":
+                bool(summary["validation"] and summary["validation"]["ok"]),
+            "the exported rejected log shows the damaged batches":
+                exported["files"]["rejected.csv"]["rows"] == nacks,
+        }
+
+        result = {
+            "orders": n_orders, "batches": len(chunks), "nacks": nacks,
+            "duplicates": duplicates, "restarts": restarts,
+            "trades": len(actual[0]), "elapsed_s": elapsed,
+            "rate": n_orders / elapsed, "failure": failure,
+            "export": {"dir": export_path, "files": exported["files"],
+                       "verified": verified["ok"]},
+            "checks": checks, "ok": all(checks.values()),
+        }
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+        try:
+            pb.db.close()
+        except sqlite3.Error:
+            pass
+        parent.close()
+        folder.cleanup()          # a user-chosen export folder is outside it
+
+    return result
+
+
+def format_end_to_end_report(r: dict) -> str:
+    lines = [
+        f"END-TO-END: {r['orders']:,} orders in {r['batches']} batches through a "
+        f"separate producer process; {r['nacks']} damaged batches re-sent, "
+        f"{r['duplicates']} duplicate delivery ignored, {r['restarts']} restarts; "
+        f"{r['trades']:,} trades",
+        f"  whole run {r['elapsed_s']:.2f} s ({r['rate']:,.0f} orders/s)",
+        f"  exported {len(r['export']['files'])} files to {r['export']['dir']}",
+        "  checks:",
+    ]
+    lines += [f"    {'ok  ' if ok else 'FAIL'} {name}"
+              for name, ok in r["checks"].items()]
+    if r["failure"]:
+        lines.append(f"    producer problem: {r['failure']}")
+    lines.append("  RESULT: " + ("ALL CHECKS PASSED" if r["ok"] else "FAILED"))
+    return "\n".join(lines)
+
+
+# ============================================================
+# BENCHMARK REPORT (DAYS 11-21)
 # ============================================================
 
 def _report_load_table(runs: list[dict]) -> str:
@@ -3231,6 +3709,9 @@ _DAY_LOG = [
     (18, "Missing and failed records: quarantine, rollback, retry, reconcile"),
     (19, "Recovery and resiliency testing: killed processes, injected "
          "failures, backups"),
+    (20, "Export logs for reporting: CSV/JSON files with a verified manifest"),
+    (21, "End-to-end validation: producer process, damaged batches, restart, "
+         "export, compared with a direct run"),
 ]
 
 
@@ -3324,18 +3805,16 @@ def _tests_summary_line(tests) -> str:
 
 
 def _total_tests_section(tests) -> list[str]:
-    """Total test count, per file, with what Day 16 added."""
+    """Total test count, per file, with what Days 16 to 21 added."""
 
-    lines = ["", "### Total tests (including Days 16 to 19)", ""]
+    lines = ["", "### Total tests (including Days 16 to 21)", ""]
 
     if tests is None:
         return lines + ["Not run. Run without --skip-tests to include them.", ""]
 
     by_file = tests["by_file"]
-    day16 = sum(n for name, n in by_file.items() if _test_day(name) == "16")
-    day17 = sum(n for name, n in by_file.items() if _test_day(name) == "17")
-    day18 = sum(n for name, n in by_file.items() if _test_day(name) == "18")
-    day19 = sum(n for name, n in by_file.items() if _test_day(name) == "19")
+    added = {d: sum(n for name, n in by_file.items() if _test_day(name) == d)
+             for d in ("16", "17", "18", "19", "20", "21")}
 
     def day_key(item):
         day = _test_day(item[0])
@@ -3345,9 +3824,9 @@ def _total_tests_section(tests) -> list[str]:
     lines += [f"**{tests['ran']} tests in total, "
               f"{'all passing' if tests['ok'] else 'SOME FAILING'}** "
               f"(ran in {tests['seconds']:.1f} s). "
-              f"Day 16 added {day16} tests, Day 17 added {day17}, Day 18 "
-              f"added {day18} and Day 19 added {day19}; before Day 16 the "
-              f"total was {tests['ran'] - day16 - day17 - day18 - day19}.",
+              + ", ".join(f"Day {d} added {n}" for d, n in added.items())
+              + f"; before Day 16 the total was "
+              f"{tests['ran'] - sum(added.values())}.",
               "",
               "| Test file | Day | Tests |", "|---|---|---:|"]
 
@@ -3365,7 +3844,8 @@ def _total_tests_section(tests) -> list[str]:
 
 
 def _day15_section(runs: list[dict], zc: dict, ipc_text, tests,
-                   db_run: dict, pv: dict, fh: dict, rs: dict) -> list[str]:
+                   db_run: dict, pv: dict, fh: dict, rs: dict,
+                   e2e: dict) -> list[str]:
     big = runs[-1]
     by_name = {c["check"]: c["passed"] for c in zc["checks"]}
 
@@ -3395,14 +3875,18 @@ def _day15_section(runs: list[dict], zc: dict, ipc_text, tests,
          "repaired (Day 18)", fh["ok"]),
         ("Data survives killed processes, injected failures and a damaged "
          "file (Day 19)", rs["ok"]),
+        ("Logs export with a manifest that matches the database (Day 20)",
+         e2e["checks"]["exported files match their manifest and the database"]),
+        ("End-to-end run equals a direct run despite damage, duplicates and "
+         "a restart (Day 21)", e2e["ok"]),
     ]
     if tests is not None:
         checklist.append(
             (f"Full test suite passes ({tests['ran']} tests)", tests["ok"])
         )
 
-    lines = ["", "## Days 15 to 19: Final summary", "",
-             "### Work completed, Days 1 to 19", "",
+    lines = ["", "## Days 15 to 21: Final summary", "",
+             "### Work completed, Days 1 to 21", "",
              "| Day | Work |", "|---|---|"]
     lines += [f"| {d} | {text} |" for d, text in _DAY_LOG]
 
@@ -3461,6 +3945,7 @@ def build_benchmark_report(
     pv = run_persistence_validation(sizes[0])
     fh = run_failure_handling_demo(20_000)
     rs = run_resilience_suite(3000, rounds=6, crashes=4)
+    e2e = run_end_to_end_validation(10_000)
 
     ipc_text = None
     if include_ipc and os.path.exists("ipc_benchmark.py"):
@@ -3477,13 +3962,13 @@ def build_benchmark_report(
 
     tests = run_test_suite() if include_tests else None
 
-    all_ok = (all(r["ok"] for r in runs) and zc["ok"] and db_run["ok"] and pv["ok"] and fh["ok"] and rs["ok"]
+    all_ok = (all(r["ok"] for r in runs) and zc["ok"] and db_run["ok"] and pv["ok"] and fh["ok"] and rs["ok"] and e2e["ok"]
               and (tests is None or tests["ok"]))
 
     lines = [
-        "# ChronosMatch Benchmark Report (Day 19)",
+        "# ChronosMatch Benchmark Report (Day 21)",
         "",
-        f"Teammate 3 - Days 1 to 19 - {time.strftime('%Y-%m-%d %H:%M')}",
+        f"Teammate 3 - Days 1 to 21 - {time.strftime('%Y-%m-%d %H:%M')}",
         "",
         f"Machine: {platform.system()} {platform.release()}, "
         f"{os.cpu_count()} logical CPUs, Python {platform.python_version()} "
@@ -3591,6 +4076,38 @@ def build_benchmark_report(
     lines += ["", "Limit: restoring from a backup loses any work done after the "
               "backup was taken.", ""]
 
+    lines += [
+        "", "## Day 20: Log export for reporting", "",
+        f"The logs of the end-to-end run were exported to "
+        f"{len(e2e['export']['files'])} files and checked against their "
+        f"manifest and the database: "
+        f"**{'match' if e2e['export']['verified'] else 'MISMATCH'}**.",
+        "",
+        "| File | Rows | Bytes | SHA-256 (first 16) |", "|---|---:|---:|---|",
+    ]
+    for fname, info in e2e["export"]["files"].items():
+        rows = "" if info["rows"] is None else f"{info['rows']:,}"
+        lines.append(f"| {fname} | {rows} | {info['bytes']:,} | "
+                     f"{info['sha256'][:16]} |")
+    lines += ["", "Events are ordered by sequence number; the database stores "
+              "no clock times.", ""]
+
+    lines += [
+        "", "## Day 21: End-to-end validation", "",
+        f"{e2e['orders']:,} orders in {e2e['batches']} batches went from a "
+        f"separate producer process, through the binary format, into the book "
+        f"and database, with matching after every batch. {e2e['nacks']} "
+        f"batches were damaged in transit and re-sent, {e2e['duplicates']} "
+        f"batch was delivered twice, and the database was closed and reopened "
+        f"({e2e['restarts']} restarts). {e2e['trades']:,} trades resulted, and "
+        f"the whole run took {e2e['elapsed_s']:.2f} s "
+        f"({e2e['rate']:,.0f} orders/s). Everything was compared with a direct "
+        "in-memory run.",
+        "",
+    ]
+    lines += [f"- {'PASS' if ok else 'FAIL'}: {name}"
+              for name, ok in e2e["checks"].items()]
+
     lines += _total_tests_section(tests)
 
     lines += ["", "## Day 11: IPC methods compared", ""]
@@ -3602,7 +4119,7 @@ def build_benchmark_report(
 
     lines += ["", "## Findings", ""]
     lines += [f"- {text}" for text in _report_findings(runs, zc)]
-    lines += _day15_section(runs, zc, ipc_text, tests, db_run, pv, fh, rs)
+    lines += _day15_section(runs, zc, ipc_text, tests, db_run, pv, fh, rs, e2e)
     lines += [
         "",
         "## What this means",
@@ -3674,6 +4191,38 @@ if __name__ == "__main__":
         for name in sorted(set(broken)):
             print(f"CANNOT IMPORT (not counted): {name}")
         sys.exit(1 if broken else 0)
+
+    if "--end-to-end" in sys.argv:
+        n = 20_000
+        if "--orders" in sys.argv:
+            n = int(sys.argv[sys.argv.index("--orders") + 1].replace(",", ""))
+        export_to = None
+        if "--export-dir" in sys.argv:
+            export_to = sys.argv[sys.argv.index("--export-dir") + 1]
+        report = run_end_to_end_validation(n, export_dir=export_to)
+        print(format_end_to_end_report(report))
+        sys.exit(0 if report["ok"] else 1)
+
+    if "--export-logs" in sys.argv:
+        i = sys.argv.index("--export-logs")
+        if len(sys.argv) < i + 3:
+            print("Usage: python orderbook.py --export-logs DATABASE FOLDER "
+                  "[--format csv|jsonl|both] [--overwrite] [--raw]")
+            sys.exit(2)
+        db_file, folder_out = sys.argv[i + 1], sys.argv[i + 2]
+        choice = (sys.argv[sys.argv.index("--format") + 1]
+                  if "--format" in sys.argv else "csv")
+        formats = ("csv", "jsonl") if choice == "both" else (choice,)
+        try:
+            result = export_logs(db_file, folder_out, formats,
+                                 overwrite="--overwrite" in sys.argv,
+                                 spreadsheet_safe="--raw" not in sys.argv)
+        except (FileNotFoundError, FileExistsError, ValueError, sqlite3.Error) as exc:
+            print(f"Cannot export: {exc}")
+            sys.exit(2)
+        check = verify_export(folder_out, db_file)
+        print(format_export_report(result, check))
+        sys.exit(0 if check["ok"] and result["validation_ok"] else 1)
 
     if "--crash-worker" in sys.argv:
         i = sys.argv.index("--crash-worker")
